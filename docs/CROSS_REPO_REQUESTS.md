@@ -4,7 +4,7 @@
 
 用户已同意复用现有 `TASK_COMPLETE`，U=0 表示视觉确认，U=1 表示视觉超时后的未确认撤离。下位自身的前段超时继续用原 ENTER 完成回报撤离。两种超时均不设置首件、不计送达，并保留之前已经确认的首件状态。
 
-上位联调分支已实现并通过 6 项直接检查。下位补丁基于 `Final_Run/Final_task@fd63ab7`，只在 `FinalRun` 预设启用，已核对可应用，待下位构建与实车。当前决赛桌面仍使用 `main`，等配套固件后切换上位联调代码。[完整接口、报文和下位补丁](https://github.com/danmo-teng/shijue_fangan-finals/blob/77f0ef14f1d252e4fb141f7e3b20b6cce989dc60/docs/FINALS_DELIVERY_CONFIRMATION.md)
+已对照下位 `Final_Run/Final_task@d8950b9` 的伤员优先交接。上位联调分支保留与初赛参考 `dc4b9b0` 一致的搜索、区边观察、聚堆和选侧优先级，并补齐暂停及保留进度停车时的同动作完成登记，8 项相关离线检查通过。下位 `d8950b9` 只更新文档，U=1 和本地超时首件处理仍待配套。补丁基于 `fd63ab7`，只在 `FinalRun` 预设启用。当前桌面使用 `main`，等配套固件后切换上位联调代码。[完整接口、报文和下位补丁](https://github.com/danmo-teng/shijue_fangan-finals/blob/5c8937f559f727b48e233b33b5379b5468d7ebf6/docs/FINALS_DELIVERY_CONFIRMATION.md) · [下位交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/d8950b976f23cfd8c5696783773eb03d576bff06/docs/FINALS_PRIORITY_HANDOFF.md)
 
 ## FINALS-SINGLE-ITEM 决赛第一批已核对，第二批待两端配套
 

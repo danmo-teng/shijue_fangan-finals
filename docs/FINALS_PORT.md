@@ -1,6 +1,6 @@
 # 决赛基线
 
-超时撤离误记首件的修复已在决赛联调分支实现。只在视觉确认并收到本次开爪退出回报后记送达，两种超时都保留原搜索阶段。默认桌面入口仍用 main，需和下位配套固件一起启用。[联调实现和下位配套](https://github.com/danmo-teng/shijue_fangan-finals/blob/77f0ef14f1d252e4fb141f7e3b20b6cce989dc60/docs/FINALS_DELIVERY_CONFIRMATION.md)
+超时撤离误记首件的修复已在决赛联调分支实现。只在视觉确认并收到本次开爪退出回报后记送达，两种超时都保留原搜索阶段。已按下位交接复核伤员优先，补齐暂停和停车重发时对已收到的送达回报的登记。默认桌面入口仍用 main，需和下位配套固件一起启用。[联调实现和下位配套](https://github.com/danmo-teng/shijue_fangan-finals/blob/5c8937f559f727b48e233b33b5379b5468d7ebf6/docs/FINALS_DELIVERY_CONFIRMATION.md)
 
 下一阶段优先稳定送达首件普通物资。上位比赛流程已停用橙黑分离 `U=8200`、门口横移滤除和首件撞堆，改走原夹爪分离及真实整爪复审。下位 `Final_Run/Final_task@fd63ab7` 的 `FinalRun` 预设已关闭抓后自动抬爪滤除，两端普通分离在源码及离线流程中一致。单件运输仍待两端统一审核，板端实际版本和整车效果待验。见[决赛单件运输适配范围](FINALS_SINGLE_ITEM_PLAN.md)。
 
