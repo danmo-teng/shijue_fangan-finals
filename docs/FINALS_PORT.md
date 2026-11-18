@@ -1,8 +1,8 @@
 # 决赛基线
 
-决赛联调 `3829156` 已对齐下位 `Final_task@4d14c19` 的超时撤离和单件运输，保留首件普通和伤员优先搜索。两端代码和离线检查已完成，板端实际版本及实车效果待验。默认桌面仍用 main，现场配对切换。[联调单件实现](https://github.com/danmo-teng/shijue_fangan-finals/blob/3829156ba5bc50832ec29ee860e9b6b76a4d4c10/docs/FINALS_SINGLE_ITEM_PLAN.md)
+决赛 main 已配对 `Final_Run/Final_task@4656c77`。首件正式投送为单普通，确认进区并完成本次退出后登记；首件后纯普通、核心 1～3 件整批直送，伤员单件。分离复用左右夹爪及真实整爪复审，每批最多三次。沿用送达确认与未确认超时退出。32 项相关离线检查通过，板端实际版本及实车效果待验。[本轮实现和接口边界](FINALS_QUESTIONNAIRE_SEPARATION_20261119.md)
 
-上位比赛流程已停用橙黑分离 `U=8200`、门口横移滤除和首件撞堆，改走原夹爪分离及真实整爪复审。下位 `FinalRun` 预设已关闭抓后自动抬爪滤除。见[决赛单件运输适配范围](FINALS_SINGLE_ITEM_PLAN.md)。
+上位已停用橙黑分离 `U=8200`、门口横移滤除和首件撞堆。下位 `FinalRun` 预设关闭抓后自动抬爪滤除。决赛现场需使用匹配固件。
 
 决赛上位机位于 `/home/sunrise/RDK_X5/finals`。比赛流程和定位基线来自初赛 `302427138e426536673738d83cdf57ac6cd7242f`。模型使用 `vision/x5_output_640/yolo26n_6cls_640_1118_final_bpu_bayese_640x640_nv12.bin`，沿用相同的六类顺序、0.20 置信阈值和 0.45 NMS。普通、核心、危险及伤员的程序分支依据类别编号。
 

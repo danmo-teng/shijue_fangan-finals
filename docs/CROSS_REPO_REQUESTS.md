@@ -1,14 +1,14 @@
-# 两端最新修改要求（初赛基线存档）
+# 两端最新修改要求
 
-## FINALS-DELIVERY-CONFIRMATION 决赛超时撤离与首件确认
+## FINALS-QUESTIONNAIRE-20261119 决赛载荷、分离与送达配套回执
 
-用户已同意复用现有 `TASK_COMPLETE`，U=0 表示视觉确认，U=1 表示视觉超时后的未确认撤离。下位自身的前段超时继续用原 ENTER 完成回报撤离。两种超时均不设置首件、不计送达，并保留之前已经确认的首件状态。
+上位实现 `7cb65916d549060d8c984d67d8e031f99d29bf85` 已合入本仓库 main，对照下位 `Final_Run/Final_task@4656c777c3ab2958b2a8e32648b2f97b0a6d9948`。此项替代之前的决赛单件审核方案。
 
-下位 `Final_Run/Final_task@919352e` 已配套 U=1 和本地超时的首件状态，最新 `4d14c19` 包含这项改动。上位联调分支沿用逐动作完成登记、暂停及保局重发处理。现场需核对实际烧录身份后与上位联调版配对，当前桌面仍用 `main`。[送达确认接口](https://github.com/danmo-teng/shijue_fangan-finals/blob/3829156ba5bc50832ec29ee860e9b6b76a4d4c10/docs/FINALS_DELIVERY_CONFIRMATION.md) · [下位交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/4d14c193284b44748395617a00736c369dca24af/docs/CROSS_REPO_REQUESTS.md)
+- 首件单普通；首件后纯普通或核心 1～3 件整批直送；伤员单件。开局搬堆和视觉扫障取货按非空载荷走原搬移，找回原货按正式资格和原目的地复审。
+- 整批非法才分离。原有效锁定优先，重选时优先纯净可运侧，同侧特殊混装及最多三次总预算按问卷。首件前纯橙黑在抓取审核切换为原暂存角色。
+- 左右无法判定保留真实总数，抓取审核用原无侧观察，mode48 用下位原相机复看。有效画面仅用当帧实际检测。沿用 `TASK_COMPLETE U=0/1` 与原动作配对，未确认退出不记送达。
 
-## FINALS-SINGLE-ITEM 决赛单件运输两端源码已配套
-
-上位联调 `3829156` 与下位 `Final_task@4d14c19` 对齐为单件。覆盖抓前、抓后、预备点、恢复、开局与扫障，真实多件按原审核报文进入分离或退出。旧视觉取障 mode43 的非法审核沿原超时重搜，mode45 的找回失败走原放弃。缓存加件后撤销原单件许可。保持首件普通和伤员搜索，分离保留单伤员及伤员混装候选，多件材料只参与分离。19 项上位相关离线检查通过，现场待配对验收。[上位单件实现说明](https://github.com/danmo-teng/shijue_fangan-finals/blob/3829156ba5bc50832ec29ee860e9b6b76a4d4c10/docs/FINALS_SINGLE_ITEM_PLAN.md) · [下位载荷判定](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/4d14c193284b44748395617a00736c369dca24af/Main/Src/Task.c#L791)
+32 项相关离线检查通过。现场仍需确认板端实际运行的 FinalRun 版本，并用决赛物料验证抓取和投送。mode48 的持续未归侧、以及在 mode48 才出现的橙黑暂存限制，见[上位实现说明](FINALS_QUESTIONNAIRE_SEPARATION_20261119.md)。[下位交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/4656c777c3ab2958b2a8e32648b2f97b0a6d9948/docs/FINALS_QUESTIONNAIRE_SEPARATION_20261119.md)
 
 以下为随初赛 3024271 复制的历史记录。决赛的当前状态见 [决赛移植说明](FINALS_PORT.md)。
 
