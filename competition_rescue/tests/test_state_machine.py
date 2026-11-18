@@ -1094,31 +1094,65 @@ def test_post_delivery_returns_to_saved_station_after_local_exit() -> None:
 
 
 def test_delivery_requires_outside_to_inside_transition() -> None:
+    from protocol import CMD_TASK_COMPLETE
     mission = CompetitionMission(
         CompetitionSettings(side="red", start_zone=1, initial_stash_enabled=False)
     )
-    mission.first_common_delivered = False
-    mission.selected_batch = CargoBatch((1,), ("green_supply",), "material")
-    mission._set_state(CompetitionState.NAVIGATE, 0.0)
+    mission._select_batch(CargoBatch((1,), ("green_supply",), "material"))
+    mission._latch_carried_manifest(CargoAudit(left_class="green_supply", left_count=1, total_count=1))
+    mission._set_state(CompetitionState.DELIVERY_VERIFY, 0.)
+    mission._start_delivery_observation(0., 1)
     fence_pose = PoseSnapshot(True, -0.15, 1.0275, 90.0, 5.0)
+    verifying = stm(mode=STM_MODE_RAM_VERIFY)
     outside = VisionSnapshot(
         frame_sequence=1,
         delivery_target_found=True,
         delivery_target_outside_safe_zone=True,
     )
-    output = mission.step(outside, fence_pose, stm(mode=10, flags=34), 0.1)
-    assert output.state == CompetitionState.ENTER_SAFE_ZONE
+    output = mission.step(outside, fence_pose, verifying, 0.1)
+    assert output.state == CompetitionState.DELIVERY_VERIFY
 
-    for sequence in range(2, 8):
+    for sequence in range(2, 7):
         inside = VisionSnapshot(
             frame_sequence=sequence,
             delivery_target_found=True,
             delivery_target_inside_safe_zone=True,
         )
-        output = mission.step(inside, fence_pose, stm(mode=15, flags=34), sequence * 0.1)
+        output = mission.step(inside, fence_pose, verifying, sequence * 0.1)
     assert output.state == CompetitionState.TASK_COMPLETE
+    assert output.command.opcode == CMD_TASK_COMPLETE and output.command.aux == 0
+    assert not mission.first_common_delivered and mission.delivery_count == 0
+    complete = replace(verifying, mode=16, context_valid=True, context_matches=True,
+                       accepted_command=CMD_TASK_COMPLETE, action_status=3)
+    output = mission.step(VisionSnapshot(), fence_pose, complete, .7)
+    assert output.state == CompetitionState.RETURN_CENTER
     assert mission.delivery_count == 1
-    assert mission.first_common_delivered
+    assert mission.first_common_delivered and mission.orange_search_round == 1
+
+
+def test_finals_visual_timeout_retains_unconfirmed_exit_on_repeats() -> None:
+    from protocol import CMD_TASK_COMPLETE, TASK_COMPLETE_UNCONFIRMED
+
+    for first_delivered in (False, True):
+        m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+        m.first_common_delivered = first_delivered
+        m.delivery_count = int(first_delivered)
+        m.orange_search_round = int(first_delivered)
+        m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
+        m._latch_carried_manifest(CargoAudit(left_class="green_supply", left_count=1, total_count=1))
+        m._set_state(CompetitionState.DELIVERY_VERIFY, 1.)
+        m._start_delivery_observation(1., 1)
+        waiting = stm(mode=STM_MODE_RAM_VERIFY)
+        out = m.step(VisionSnapshot(), pose(), waiting, 2.01)
+        assert out.event == "delivery_timeout_complete" and out.command.opcode == CMD_TASK_COMPLETE
+        assert out.command.aux == TASK_COMPLETE_UNCONFIRMED
+        assert int.from_bytes(out.command.to_frame(2)[10:12], "big") == 1
+        assert m.step(VisionSnapshot(), pose(), waiting, 2.02).command == out.command
+        done = replace(waiting, mode=16, context_valid=True, context_matches=True,
+                       accepted_command=CMD_TASK_COMPLETE, action_status=3)
+        assert m.step(VisionSnapshot(), pose(), done, 2.03).state == CompetitionState.RETURN_CENTER
+        assert m.first_common_delivered == first_delivered
+        assert m.delivery_count == m.orange_search_round == int(first_delivered)
 
 
 def test_boundary_guard_points_back_into_field() -> None:
@@ -3389,7 +3423,7 @@ def test_delivery_early_confirmation_releases_before_range_done_and_waits_for_pa
     assert out.command.opcode == CMD_TASK_COMPLETE
     assert out.event == "delivery_early_complete_requested"
     assert m.delivery_completion_basis == "delivery_visual_early" and m.delivery_inside_hits == 5
-    assert m.delivery_count == 1
+    assert m.delivery_count == 0
     for feedback in (replace(status, mode=12, flags=0, accepted_command=CMD_TASK_COMPLETE),
                      replace(status, mode=16, flags=0, accepted_command=CMD_TASK_COMPLETE,
                              context_matches=False, action_status=3)):
@@ -4035,7 +4069,9 @@ def test_first_three_post_green_rounds_scan_orange_then_allow_materials():
     assert m._choose_initial_green(VisionSnapshot(cargo=(green,)))==green
     m._select_batch(CargoBatch((1,),('green_supply',),'material'))
     m._latch_carried_manifest(CargoAudit(left_class='green_supply',left_count=1,total_count=1))
-    def finish(t):return m._finish_delivery(stm(mode=16),t,basis='test_existing_exit',message='',event='')
+    def finish(t):
+        m._finish_delivery(stm(mode=16), t, basis='delivery_visual_confirmed', message='', event='')
+        m._register_confirmed_delivery()
     finish(1.)
     for expected_round in (1,2,3):
         assert m.orange_search_round==expected_round and m._orange_only_search()

@@ -3528,8 +3528,9 @@ def test_delivery_local_timeout_exit_wins_pending_completion_without_reusing_act
             root = Path(d)
             m = CompetitionMission(CompetitionSettings(side='red', initial_stash_enabled=False,
                                                        delivery_early_exit_enabled=True))
-            m._select_batch(CargoBatch((11,), ('injured_orange',), 'injury'))
-            m.carried_manifest = ('injured_orange',)
+            m._select_batch(CargoBatch((11,), ('green_supply',), 'material'))
+            m.carried_manifest = ('green_supply',)
+            m.confirmed_delivery_destination = 'material'
             m.state = CompetitionState.ENTER_SAFE_ZONE
             planner = CompetitionPlanner(m, root/'pose', root/'stm', root/'command',
                                          root/'diag', JsonlLog(root/'events'), 50)
@@ -3554,7 +3555,8 @@ def test_delivery_local_timeout_exit_wins_pending_completion_without_reusing_act
             assert result.state == CompetitionState.RETURN_CENTER
             assert result.event == 'delivery_push_timeout_exit'
             assert m.delivery_completion_basis == 'delivery_push_timeout'
-            assert m.delivery_count == 1
+            assert not m.first_common_delivered
+            assert m.delivery_count == m.orange_search_round == 0
             planner._publish(result)
             assert result.command.opcode == CMD_RETURN_CENTER
             assert planner.protocol_action == (high_water + 1) & 65535

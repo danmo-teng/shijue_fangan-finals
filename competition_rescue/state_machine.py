@@ -56,6 +56,7 @@ from protocol import (
     CMD_RETURN_CENTER,
     CMD_SIDE_VALID,
     CMD_TASK_COMPLETE,
+    TASK_COMPLETE_UNCONFIRMED,
     CMD_TARGET_RIGHT,
     CMD_ENTER_SAFE_ZONE,
     CMD_YIELD_BACKOFF,
@@ -5518,36 +5519,38 @@ class CompetitionMission:
     def _finish_delivery(
         self, stm: StmSnapshot, now: float, *, basis: str, message: str, event: str
     ) -> CompetitionOutput:
-        batch = self.selected_batch
-        first_green_before = self.first_common_delivered
-        new_delivery = not self.delivery_counted_for_batch
         if self.obstacle_route is not None and self.obstacle_route.awaiting_obstacle_delivery:
             self.obstacle_route.recover_after_delivery = True
         self.delivery_completion_basis = basis
         self._clear_cluster_context(reset_attempts=True)
         self._set_state(CompetitionState.TASK_COMPLETE, now)
         self.task_complete_initial_ack = stm.acknowledged_sequence
-        if not self.delivery_counted_for_batch:
-            self.delivery_count += 1
-            self.delivery_counted_for_batch = True
-        if (
-            self.carried_has_green or
-            (batch is not None and "green_supply" in batch.classes)
-        ):
-            self.first_common_delivered = True
-        if new_delivery and self.first_common_delivered:
-            self.orange_search_round = (1 if not first_green_before else
-                                        min(4, self.orange_search_round + 1))
-            self.orange_search_turn_deg = 0.0
         return CompetitionOutput(
             self.state,
-            CommandRequest(CMD_TASK_COMPLETE, self._side_flags()),
+            self._task_complete_command(),
             message,
-            batch,
+            self.selected_batch,
             event=event,
             tx_policy="normal_command",
             reason=basis,
         )
+
+    def _task_complete_command(self) -> CommandRequest:
+        confirmed = self.delivery_completion_basis in {"delivery_visual_early", "delivery_visual_confirmed"}
+        return CommandRequest(CMD_TASK_COMPLETE, self._side_flags(),
+                              aux=0 if confirmed else TASK_COMPLETE_UNCONFIRMED)
+
+    def _register_confirmed_delivery(self) -> None:
+        if self.delivery_counted_for_batch or self._task_complete_command().aux != 0:
+            return
+        first_before = self.first_common_delivered
+        self.delivery_count += 1
+        self.delivery_counted_for_batch = True
+        if self.carried_manifest == ("green_supply",) and self.confirmed_delivery_destination == "material":
+            self.first_common_delivered = True
+        if self.first_common_delivered:
+            self.orange_search_round = 1 if not first_before else min(4, self.orange_search_round + 1)
+            self.orange_search_turn_deg = 0.0
 
     def _delivery_local_exit_output(
         self, pose: PoseSnapshot, stm: StmSnapshot, now: float,
@@ -5581,7 +5584,7 @@ class CompetitionMission:
             stm,
             now,
             basis="delivery_visual_timeout",
-            message="投送视觉观察达到1秒仍未确认，发送TASK_COMPLETE进入退出返中阶段",
+            message="投送视觉观察达到1秒仍未确认，按未确认退出并返回搜索点",
             event="delivery_timeout_complete",
         )
 
@@ -8607,11 +8610,16 @@ class CompetitionMission:
             local_exit = self._delivery_local_exit_output(pose, stm, now)
             if local_exit is not None:
                 return local_exit
-            if (self.delivery_completion_basis == "delivery_visual_early" and not (
-                    stm.fresh and not stm.gripper_closed and stm.context_valid and stm.context_matches and
-                    stm.accepted_command == CMD_TASK_COMPLETE and stm.action_status & 3 == 3 and
-                    stm.mode in {STM_MODE_EXIT_SAFE_ZONE, STM_MODE_FACE_FIELD_CENTER})):
-                return CompetitionOutput(self.state, CommandRequest(CMD_TASK_COMPLETE, self._side_flags()),
+            completion_done = (
+                stm.fresh and not stm.fault and not stm.gripper_closed and
+                stm.context_valid and stm.context_matches and
+                stm.accepted_command == CMD_TASK_COMPLETE and stm.action_status & 3 == 3 and
+                stm.mode in {STM_MODE_EXIT_SAFE_ZONE, STM_MODE_FACE_FIELD_CENTER}
+            )
+            if completion_done:
+                self._register_confirmed_delivery()
+            if self.delivery_completion_basis == "delivery_visual_early" and not completion_done:
+                return CompetitionOutput(self.state, self._task_complete_command(),
                     "提前完成请求已发出，等待本次开爪/退出回包", self.selected_batch,
                     reason="delivery_early_release_pending")
             if (
@@ -8634,7 +8642,7 @@ class CompetitionMission:
                 self._clear_selected_batch()
                 self._begin_return(stm, now, after_delivery=True)
                 return self._return_center_output(pose, now, "投送后接回记住的搜索点")
-            return CompetitionOutput(self.state, CommandRequest(CMD_TASK_COMPLETE, self._side_flags()), "等待下位机张爪并退出安全区")
+            return CompetitionOutput(self.state, self._task_complete_command(), "等待下位机张爪并退出安全区")
 
         if self.state == CompetitionState.RETURN_CENTER:
             self._latch_return_command_acceptance(stm)
