@@ -366,6 +366,18 @@ class CargoAudit:
         )
 
 
+def _single_item_audit(audit: CargoAudit | CargoAuditPayload) -> bool:
+    """Match the FinalRun quantity check without changing any reported count."""
+    empty = {"", "none"}
+    mixed = {"mixed_material", "mixed_material_two_green"}
+    return (
+        audit.total_count == 1 and (audit.left_count, audit.right_count) in {(1, 0), (0, 1)} and
+        (audit.left_count == 0) == (audit.left_class in empty) and
+        (audit.right_count == 0) == (audit.right_class in empty) and
+        audit.left_class not in mixed and audit.right_class not in mixed and not audit.injury_mixed
+    )
+
+
 @dataclass(frozen=True)
 class VisionSnapshot:
     frame_sequence: int = 0
@@ -569,7 +581,7 @@ class CompetitionSettings:
     batch_radius_m: float = 0.55
     near_material_max_distance_m: float = 0.85
     capture_clearance_m: float = 0.16
-    max_batch_count: int = 3
+    max_batch_count: int = 1
     center_stop_radius_m: float = 0.0
     return_zero_tolerance_m: float = 0.080
     pre_grab_advance_enabled: bool = False
@@ -628,8 +640,8 @@ class CompetitionSettings:
             raise ValueError("side must be red or blue")
         if self.start_zone not in {1, 2, 3, 4}:
             raise ValueError("start zone must be 1..4")
-        if not 1 <= self.max_batch_count <= 3:
-            raise ValueError("post-first material delivery supports one to three items")
+        if self.max_batch_count != 1:
+            raise ValueError("FinalRun transport requires one item")
         if not 1 <= self.approach_center_tolerance_px <= CAMERA_IMAGE_CENTER_X_PX:
             raise ValueError("approach centre tolerance is outside the image")
         if (
@@ -1748,10 +1760,9 @@ class CompetitionMission:
     ) -> tuple:
         if (
             self.selected_batch is not None and
-            self.selected_batch.initial_stash and
-            audit.total_count > 0
+            self.selected_batch.initial_stash and audit_valid
         ):
-            return ("STASH_NONEMPTY",)
+            return ("STASH_SINGLE_ITEM",)
         if audit_valid:
             if not self.first_common_delivered:
                 return ("FIRST_GREEN",)
@@ -1767,7 +1778,7 @@ class CompetitionMission:
 
     def _latch_carried_manifest(self, audit: CargoAudit) -> None:
         # Called only at a real, acknowledged closed-claw audit handoff.
-        self.confirmed_load_audit = audit
+        self.confirmed_load_audit = audit if _single_item_audit(audit) else None
         self.transport_load_reuse_active = False
         self.carried_manifest = self._manifest_for_audit(audit)
         self.carried_total_count = audit.total_count
@@ -2622,7 +2633,8 @@ class CompetitionMission:
             (audit.total_count > 0 and (
                 audit.total_count != prior.total_count or
                 Counter(self._manifest_for_audit(audit)) != Counter(self._manifest_for_audit(prior))))))
-        if ((stm.fresh and not stm.gripper_closed) or vision.carried_incompatible_cargo or
+        if (not _single_item_audit(prior) or
+                (stm.fresh and not stm.gripper_closed) or vision.carried_incompatible_cargo or
                 observed_extra or positive_change or
                 self._first_green_core_conflict_active()):
             was_reusing = self.transport_load_reuse_active
@@ -2664,6 +2676,7 @@ class CompetitionMission:
         if now - self.closed_load_gap_started_s < self.settings.closed_load_gap_timeout_s:
             return None
         if (stm.mode == STM_MODE_TRANSPORT_AUDIT and self.confirmed_load_audit is not None and
+                _single_item_audit(self.confirmed_load_audit) and
                 not self.selected_batch.initial_stash):
             if not self._pose_fresh(pose):
                 return CompetitionOutput(self.state, self._pause(),
@@ -2815,6 +2828,7 @@ class CompetitionMission:
         return bool(
             self.pending_audit is not None and self.pending_audit_payload is not None and
             self.pending_audit_valid and self.pending_audit_payload.stable and
+            _single_item_audit(self.pending_audit_payload) and
             self.pending_audit_frame_sequence and
             (post_grab or (sweep and self.pending_audit_release_context in {"valid", "disperse_reaudit"}))
         )
@@ -3745,31 +3759,21 @@ class CompetitionMission:
         )
 
     def _audit_valid(self, audit: CargoAudit, *, recovery: bool = False) -> bool:
-        counts = Counter(self._manifest_for_audit(audit))
-        if self.selected_batch is None and not recovery:
+        if (self.selected_batch is None and not recovery) or not _single_item_audit(audit):
             return False
-        # Opening relocation is non-empty-pile handling, not formal sorting.
-        # Match F407 STASH_NONEMPTY before count/category/side checks, both
-        # before grabbing and in the mode23 post-grab audit.
+        # FinalRun applies the count check to opening relocation too, then
+        # retains the relocation's separate category policy.
         if self.selected_batch is not None and self.selected_batch.initial_stash:
-            return audit.total_count > 0
+            return True
+        counts = Counter(self._manifest_for_audit(audit))
         if self._first_green_core_conflict_active() or (
                 not self.first_common_delivered and audit.first_green_core_conflict):
-            return False
-        if (audit.left_count < 0 or audit.right_count < 0 or
-                audit.left_count > 3 or audit.right_count > 3 or
-                audit.left_count + audit.right_count != audit.total_count or
-                (audit.left_count == 0) != (audit.left_class in {"", "none"}) or
-                (audit.right_count == 0) != (audit.right_class in {"", "none"})):
             return False
         if (not recovery and self.safe_sweep_reaudit_active and
                 self._audit_destination(audit) != self._sweep_original_destination()):
             return False
-        if (
-            audit.total_count <= 0 or
-            audit.total_count > self.settings.max_batch_count or
-            sum(counts.values()) != audit.total_count
-        ):
+        category = audit.left_class if audit.left_count else audit.right_class
+        if counts != Counter({category: 1}):
             return False
         if (
             audit.danger_present or
@@ -3793,16 +3797,7 @@ class CompetitionMission:
             return True
         if "injured_orange" in counts:
             return False
-        # Class6 already encodes same-claw GREEN+CORE in the existing packet.
-        # Keep its real count/composition; casualties never share this batch.
-        for category, count, green in (
-                (audit.left_class, audit.left_count, audit.left_green_count),
-                (audit.right_class, audit.right_count, audit.right_green_count)):
-            if count and category not in MATERIAL_CLASSES | {"mixed_material"}:
-                return False
-            if category == "mixed_material" and not (count >= 2 and 0 < green < count):
-                return False
-        return bool(counts) and set(counts).issubset(MATERIAL_CLASSES)
+        return set(counts).issubset(MATERIAL_CLASSES)
 
     def _cluster_audit_valid(self, audit: CargoAudit) -> bool:
         if self.selected_batch is None:
@@ -3812,24 +3807,17 @@ class CompetitionMission:
         return self._audit_valid(audit)
 
     def _side_is_legal_for_task(self, side_class: str, side_count: int) -> bool:
-        if side_count <= 0:
+        if side_count != 1:
             return False
         if self.selected_batch is not None and self.selected_batch.initial_stash:
-            return (
-                (1 <= side_count <= self.settings.max_batch_count and
-                 side_class in {"green_supply", "core_black", "mixed_material"}) or
-                (side_count == 1 and side_class == "injured_orange")
-            )
+            return side_class in MATERIAL_CLASSES | {"injured_orange"}
         if not self.first_common_delivered:
-            return side_count == 1 and side_class == "green_supply"
-        if side_count == 1 and side_class == "green_supply":
+            return side_class == "green_supply"
+        if side_class == "green_supply":
             return True
         if self.selected_batch is not None and self.selected_batch.destination == "injury":
-            return side_count == 1 and side_class == "injured_orange"
-        return (
-            1 <= side_count <= self.settings.max_batch_count and
-            side_class in {"green_supply", "core_black", "mixed_material"}
-        )
+            return side_class == "injured_orange"
+        return side_class in MATERIAL_CLASSES
 
     @staticmethod
     def _side_green_count(audit: CargoAudit, side: str) -> int:
@@ -3855,18 +3843,11 @@ class CompetitionMission:
             return ()
         count = getattr(audit, side + "_count")
         category = getattr(audit, side + "_class")
-        if not 1 <= count <= self.settings.max_batch_count or getattr(audit, side + "_invalid"):
+        if count != 1 or getattr(audit, side + "_invalid"):
             return ()
-        if category == "injured_orange":
-            manifest = (category,) if count == 1 else ()
-        elif category in MATERIAL_CLASSES:
-            manifest = (category,) * count
-        elif category == "mixed_material":
-            green = getattr(audit, side + "_green_count")
-            manifest = (("green_supply",) * green + ("core_black",) * (count-green)
-                        if 0 < green < count else ())
-        else:
+        if category not in MATERIAL_CLASSES | {"injured_orange"}:
             return ()
+        manifest = (category,)
         composition = dict(getattr(audit, side + "_class_counts"))
         if composition and Counter(composition) != Counter(manifest):
             return ()
@@ -3880,7 +3861,7 @@ class CompetitionMission:
         count = getattr(audit, side + "_count")
         counts = dict(getattr(audit, side + "_class_counts"))
         if (getattr(audit, side + "_class") != "unknown" or
-                not 2 <= count <= self.settings.max_batch_count or
+                not 2 <= count <= 3 or
                 sum(counts.values()) != count or counts.get("injured_orange") != 1 or
                 counts.get("green_supply", 0) != getattr(audit, side + "_green_count") or
                 not set(counts).issubset(MATERIAL_CLASSES | {"injured_orange"}) or
@@ -3914,11 +3895,9 @@ class CompetitionMission:
         if orange:
             candidates = orange
         elif mixed:
-            groups = {side: items for side, items in candidates.items() if len(items) >= 2}
-            candidates = groups or mixed
-            if not groups:
-                locked = self.cluster_keep_side or self.separation_keep_side
-                return locked if locked in candidates else next(iter(candidates))
+            # A mixed side can be separated, but no multi-item side can ship.
+            locked = self.cluster_keep_side or self.separation_keep_side
+            return locked if locked in mixed else next(iter(mixed))
         elif not candidates:
             return None
         most_green = max(items.count("green_supply") for items in candidates.values())
@@ -5276,6 +5255,12 @@ class CompetitionMission:
         fresh_audit = (self._audit_vision_fresh(vision, now) and camera_ready and
                        observation_valid and vision.frame_sequence > 0 and
                        vision.safe_sweep_capture_audit is not None)
+        audit = vision.safe_sweep_capture_audit or CargoAudit()
+        valid = (
+            self._audit_valid(audit) and
+            self._audit_destination(audit) == self._sweep_original_destination()
+            if context.recovering_original else _single_item_audit(audit)
+        )
         previous_command = context.audit_command
         previous_signature = context.audit_signature
         if (context.audit_last_evidence_s is not None and
@@ -5289,12 +5274,6 @@ class CompetitionMission:
         if fresh_audit and vision.frame_sequence > max(context.frame_floor, context.last_audit_frame):
             context.last_audit_frame = vision.frame_sequence
             context.audit_id = (context.audit_id + 1) & 0xFF
-            audit = vision.safe_sweep_capture_audit or CargoAudit()
-            valid = (
-                self._audit_valid(audit) and
-                self._audit_destination(audit) == self._sweep_original_destination()
-                if context.recovering_original else audit.total_count > 0
-            )
             payload = replace(
                 audit.to_protocol(
                     initial_stash=False,
@@ -5305,7 +5284,7 @@ class CompetitionMission:
             )
             signature = (
                 self._audit_signature_for_state(audit, valid, payload)
-                if context.recovering_original else ("SWEEP_NONEMPTY", audit.total_count > 0)
+                if context.recovering_original else ("SWEEP_SINGLE_ITEM", valid, payload.semantic_signature)
             )
             observed = vision.observed_monotonic_s if vision.observed_monotonic_s is not None else now
             context.audit_last_evidence_s = observed
@@ -5351,10 +5330,22 @@ class CompetitionMission:
         if (fresh_audit and previous_command is not None and previous_command.audit.stable and
                 previous_signature == context.audit_signature and command.audit.stable and
                 stm.context_valid and stm.context_matches and bool(stm.action_status & 1) and
-                stm.accepted_command == CMD_CARGO_AUDIT and stm.audit_ready and stm.audit_valid and
+                stm.accepted_command == CMD_CARGO_AUDIT and stm.audit_ready and stm.audit_valid == valid and
                 self._relay_sent_since(stm, previous_command, context.audit_tx_baseline)):
-            context.grab_started = True
-            return self._safe_sweep_pickup_output(vision, stm, now)
+            if valid:
+                context.grab_started = True
+                return self._safe_sweep_pickup_output(vision, stm, now)
+            if audit.total_count > 0:
+                # Mode45 accepts the existing abandon request. Mode43 only
+                # supports its own invalid-audit exit back to obstacle search.
+                return CompetitionOutput(
+                    self.state,
+                    CommandRequest(CMD_RELEASE_BOTH, self._side_flags()) if context.recovering_original else self._hold(),
+                    f"{role}审核不符合单件，沿原出口结束本次取货",
+                    self.selected_batch, audit, reason="safe_sweep_pickup_invalid",
+                    expected_stm_modes=(STM_MODE_SAFE_SWEEP_RETRIEVE_FAILED if context.recovering_original
+                                        else approach_mode,),
+                )
         return CompetitionOutput(
             self.state, command,
             f"{role}审核{context.audit_hits}/{self.settings.audit_stable_frames}，等待AUDIT_VALID",

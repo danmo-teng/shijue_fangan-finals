@@ -2510,11 +2510,12 @@ def test_two_material_capture_keeps_full_count_and_existing_wire():
     m = CompetitionMission(CompetitionSettings(side="blue", initial_stash_enabled=False))
     m.first_common_delivered = True
     m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
-    assert m._audit_valid(audit)
+    assert not m._audit_valid(audit)
     frame = m._audit_payload(audit).frame(7)
     assert frame[6] == 6 and frame[7] == 0 and frame[8] == 2 and frame[11] == 2
     m._latch_carried_manifest(audit)
     assert m.carried_total_count == m.selected_batch.total_count == 2
+    assert m.confirmed_load_audit is None
     assert Counter(m.carried_manifest) == Counter({"green_supply": 1, "core_black": 1})
 
 
@@ -3796,7 +3797,7 @@ def test_sweep_staging_repair_and_edge_priority_without_pull():
         assert m.obstacle_route.kind=='sweep' and m.obstacle_route.sweep_left_offset_m==.15
 
 
-def test_three_material_wire_preserves_real_green_count_for_filter():
+def test_three_material_wire_preserves_real_green_count_for_separation():
     from dataclasses import replace
     from itertools import product
     from collections import Counter
@@ -3809,7 +3810,7 @@ def test_three_material_wire_preserves_real_green_count_for_filter():
         for sides in product(('left','right'),repeat=3):
             items=tuple(TrackedCargo(i+1,n,.9,(400+i*80,450,60,80),hits=5) for i,n in enumerate(names))
             audit=runner_module.audit_from_cargo(items,side_by_track=dict(zip(range(1,4),sides)))
-            assert m._audit_valid(audit)
+            assert not m._audit_valid(audit)
             packet=m._audit_payload(audit).frame(5)
             assert len(m._audit_payload(audit).semantic_signature[2]) == 8
             assert len(packet)==15 and crc16_modbus(packet[2:12])==int.from_bytes(packet[12:14],'little')
@@ -3826,6 +3827,7 @@ def test_three_material_wire_preserves_real_green_count_for_filter():
             assert green==names.count('green_supply')
             m._latch_carried_manifest(audit)
             assert Counter(m.carried_manifest)==Counter(names) and m.carried_total_count==3
+            assert m.confirmed_load_audit is None
     invalid=replace(audit,left_class='mixed_material',left_count=3,left_green_count=0,right_class='',right_count=0,total_count=3)
     wire=invalid.to_protocol(initial_stash=False,destination='material',audit_id=0)
     assert wire.unknown_present and wire.left_class=='unknown'
