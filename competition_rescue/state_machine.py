@@ -39,7 +39,6 @@ from protocol import (
     CMD_CLUSTER_TARGET,
     CMD_DISPERSE_PILE,
     CMD_DISPERSE_NEAR_KEEP,
-    SEPARATION_ORANGE_CORE_82,
     RELEASE_SAME_SIDE_BLUE,
     CMD_REUSE_POST_GRAB_AUDIT,
     CMD_REUSE_CONFIRMED_LOAD,
@@ -801,7 +800,6 @@ class CompetitionMission:
         self.pending_audit_event_emitted = False
         self.pending_audit_handoff_accepted = False
         self.invalid_release_side = "both"
-        self.invalid_release_lift_cdeg = 0
         self.invalid_release_final = False
         self.invalid_release_context = "none"
         self.initial_release_initial_ack: int | None = None
@@ -2409,8 +2407,6 @@ class CompetitionMission:
             "selective" if keep_side is not None else "observe"
         )
         self.disperse_command = CommandRequest(CMD_DISPERSE_PILE, flags,
-            aux=(SEPARATION_ORANGE_CORE_82 if not near_keep and audit is not None and
-                 self._orange_core_separation(audit, keep_side) else 0),
             source_vision_frame=audit.near_claw_frame if near_keep else None)
         self.disperse_initial_ack = stm.acknowledged_sequence if stm.fresh else None
         self.disperse_relay_tx_baseline = stm.relay_mission_tx_frames
@@ -2436,15 +2432,12 @@ class CompetitionMission:
             self.separation_request_counted = False
             self.separation_start_audit = audit
             self.separation_wanted_class = None
-            self.invalid_release_lift_cdeg = 0
             if audit is not None and self.first_common_delivered and self.invalid_release_side in {"left", "right"}:
                 keep = "right" if self.invalid_release_side == "left" else "left"
                 manifest = self._separation_side_manifest(audit, keep)
                 if manifest:
                     self.separation_wanted_class = ("injured_orange" if "injured_orange" in manifest else
                         "green_supply" if "green_supply" in manifest else "core_black")
-                if self._orange_core_separation(audit, keep):
-                    self.invalid_release_lift_cdeg = SEPARATION_ORANGE_CORE_82
             self.invalid_release_initial_ack = (
                 stm.acknowledged_sequence if stm.fresh else None
             )
@@ -3213,8 +3206,6 @@ class CompetitionMission:
                 if legal_output is not None:
                     return legal_output
                 self.cluster_audit_active = False
-                if self._should_first_green_bump(audit):
-                    return self._start_first_green_bump(audit, stm, now)
                 return self._start_disperse(audit, stm, now)
             event = (
                 "" if self.pending_audit_event_emitted
@@ -3509,8 +3500,6 @@ class CompetitionMission:
                 )
                 if legal_output is not None:
                     return legal_output
-                if self._should_first_green_bump(audit):
-                    return self._start_first_green_bump(audit, stm, now)
                 if self.cluster_keep_side is not None:
                     return self._start_disperse(audit, stm, now)
                 if self.disperse_observe_attempts < 2:
@@ -4697,8 +4686,7 @@ class CompetitionMission:
         }[self.invalid_release_side]
         if opcode == CMD_RELEASE_BOTH and self.invalid_release_context == "same_side_blue_abandon":
             return CommandRequest(opcode, self._side_flags(), aux=RELEASE_SAME_SIDE_BLUE)
-        return CommandRequest(opcode, self._side_flags(), aux=(
-            self.invalid_release_lift_cdeg if self.invalid_release_side != "both" else 0))
+        return CommandRequest(opcode, self._side_flags())
 
     def _update_delivery_observation(self, vision: VisionSnapshot, now: float) -> None:
         if self.state not in {
@@ -7094,9 +7082,6 @@ class CompetitionMission:
                     reason="transport_audit_valid", tx_policy="normal_command",
                     expected_stm_modes=(STM_MODE_ALIGN_SAFE_ZONE,),
                 )
-            filter_side = self._orange_gate_filter_side(audit, vision, pose, stm)
-            if filter_side is not None:
-                return self._begin_orange_gate_filter(filter_side, stm, now)
             if self._separation_limit_reached():
                 return self._start_capture_abandon(audit, stm, now, limit_reached=True)
             if audit.danger_present:
