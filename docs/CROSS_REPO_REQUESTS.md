@@ -1,5 +1,11 @@
 # 两端最新修改要求（初赛基线存档）
 
+## FINALS-DELIVERY-CONFIRMATION 决赛超时撤离与首件确认
+
+用户已同意复用现有 `TASK_COMPLETE`，U=0 表示视觉确认，U=1 表示视觉超时后的未确认撤离。下位自身的前段超时继续用原 ENTER 完成回报撤离。两种超时均不设置首件、不计送达，并保留之前已经确认的首件状态。
+
+上位联调分支已实现并通过 6 项直接检查。下位补丁基于 `Final_Run/Final_task@fd63ab7`，只在 `FinalRun` 预设启用，已核对可应用，待下位构建与实车。当前决赛桌面仍使用 `main`，等配套固件后切换上位联调代码。[完整接口、报文和下位补丁](https://github.com/danmo-teng/shijue_fangan-finals/blob/77f0ef14f1d252e4fb141f7e3b20b6cce989dc60/docs/FINALS_DELIVERY_CONFIRMATION.md)
+
 ## FINALS-SINGLE-ITEM 决赛第一批已核对，第二批待两端配套
 
 下位决赛基线为 `Final_Run` 的 `Final_task@fd63ab7e62e97630ee4625facc3ad20e99278e6d`。`FinalRun` 预设已有 `APP_ENABLE_POST_GRAB_FILTER=0`，保留必要重新合爪及合法审核的原出口。上位 `389c34f` 停止发出 `U=8200`、门口横移滤除与首件撞堆。下位现有普通分离接 `U=0`，按保留侧开另一爪，恢复 140° 画面并清旧审核；两端沿用同一动作身份。7 项上位离线检查通过，板端版本及实车分离待验。[下位构建配置](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/CMakeLists.txt#L55) · [下位分离交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/Main/Src/Task.c#L6728)
