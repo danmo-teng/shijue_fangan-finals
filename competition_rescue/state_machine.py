@@ -5552,6 +5552,18 @@ class CompetitionMission:
             self.orange_search_round = 1 if not first_before else min(4, self.orange_search_round + 1)
             self.orange_search_turn_deg = 0.0
 
+    def _observe_delivery_completion(self, stm: StmSnapshot) -> bool:
+        done = (
+            self.state == CompetitionState.TASK_COMPLETE and
+            stm.fresh and not stm.fault and not stm.gripper_closed and
+            stm.context_valid and stm.context_matches and
+            stm.accepted_command == CMD_TASK_COMPLETE and stm.action_status & 3 == 3 and
+            stm.mode in {STM_MODE_EXIT_SAFE_ZONE, STM_MODE_FACE_FIELD_CENTER}
+        )
+        if done:
+            self._register_confirmed_delivery()
+        return done
+
     def _delivery_local_exit_output(
         self, pose: PoseSnapshot, stm: StmSnapshot, now: float,
     ) -> CompetitionOutput | None:
@@ -8610,14 +8622,7 @@ class CompetitionMission:
             local_exit = self._delivery_local_exit_output(pose, stm, now)
             if local_exit is not None:
                 return local_exit
-            completion_done = (
-                stm.fresh and not stm.fault and not stm.gripper_closed and
-                stm.context_valid and stm.context_matches and
-                stm.accepted_command == CMD_TASK_COMPLETE and stm.action_status & 3 == 3 and
-                stm.mode in {STM_MODE_EXIT_SAFE_ZONE, STM_MODE_FACE_FIELD_CENTER}
-            )
-            if completion_done:
-                self._register_confirmed_delivery()
+            completion_done = self._observe_delivery_completion(stm)
             if self.delivery_completion_basis == "delivery_visual_early" and not completion_done:
                 return CompetitionOutput(self.state, self._task_complete_command(),
                     "提前完成请求已发出，等待本次开爪/退出回包", self.selected_batch,
