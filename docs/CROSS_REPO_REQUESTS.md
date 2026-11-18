@@ -4,13 +4,11 @@
 
 用户已同意复用现有 `TASK_COMPLETE`，U=0 表示视觉确认，U=1 表示视觉超时后的未确认撤离。下位自身的前段超时继续用原 ENTER 完成回报撤离。两种超时均不设置首件、不计送达，并保留之前已经确认的首件状态。
 
-已对照下位 `Final_Run/Final_task@d8950b9` 的伤员优先交接。上位联调分支保留与初赛参考 `dc4b9b0` 一致的搜索、区边观察、聚堆和选侧优先级，并补齐暂停及保留进度停车时的同动作完成登记，8 项相关离线检查通过。下位 `d8950b9` 只更新文档，U=1 和本地超时首件处理仍待配套。补丁基于 `fd63ab7`，只在 `FinalRun` 预设启用。当前桌面使用 `main`，等配套固件后切换上位联调代码。[完整接口、报文和下位补丁](https://github.com/danmo-teng/shijue_fangan-finals/blob/5c8937f559f727b48e233b33b5379b5468d7ebf6/docs/FINALS_DELIVERY_CONFIRMATION.md) · [下位交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/d8950b976f23cfd8c5696783773eb03d576bff06/docs/FINALS_PRIORITY_HANDOFF.md)
+下位 `Final_Run/Final_task@919352e` 已配套 U=1 和本地超时的首件状态，最新 `4d14c19` 包含这项改动。上位联调分支沿用逐动作完成登记、暂停及保局重发处理。现场需核对实际烧录身份后与上位联调版配对，当前桌面仍用 `main`。[送达确认接口](https://github.com/danmo-teng/shijue_fangan-finals/blob/3829156ba5bc50832ec29ee860e9b6b76a4d4c10/docs/FINALS_DELIVERY_CONFIRMATION.md) · [下位交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/4d14c193284b44748395617a00736c369dca24af/docs/CROSS_REPO_REQUESTS.md)
 
-## FINALS-SINGLE-ITEM 决赛第一批已核对，第二批待两端配套
+## FINALS-SINGLE-ITEM 决赛单件运输两端源码已配套
 
-下位决赛基线为 `Final_Run` 的 `Final_task@fd63ab7e62e97630ee4625facc3ad20e99278e6d`。`FinalRun` 预设已有 `APP_ENABLE_POST_GRAB_FILTER=0`，保留必要重新合爪及合法审核的原出口。上位 `389c34f` 停止发出 `U=8200`、门口横移滤除与首件撞堆。下位现有普通分离接 `U=0`，按保留侧开另一爪，恢复 140° 画面并清旧审核；两端沿用同一动作身份。7 项上位离线检查通过，板端版本及实车分离待验。[下位构建配置](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/CMakeLists.txt#L55) · [下位分离交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/Main/Src/Task.c#L6728)
-
-第二批范围待评审。下位 `task_audit_semantic` 首件后仍认可两三件材料，还会拒绝对该合法批次发出的普通分离。决赛预设应与上位统一为恰好一件才可运输，保留实际数量用于非法审核与分离。`INITIAL_STASH` 和 `SWEEP_PICKUP` 的非空即通过各有独立入口，需同批核对。保持现有报文和正常恢复，初赛固件沿用自己的规则。详细范围见[决赛单件运输适配](FINALS_SINGLE_ITEM_PLAN.md)。[下位载荷判定](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/Main/Src/Task.c#L819)
+上位联调 `3829156` 与下位 `Final_task@4d14c19` 对齐为单件。覆盖抓前、抓后、预备点、恢复、开局与扫障，真实多件按原审核报文进入分离或退出。旧视觉取障 mode43 的非法审核沿原超时重搜，mode45 的找回失败走原放弃。缓存加件后撤销原单件许可。保持首件普通和伤员搜索，分离保留单伤员及伤员混装候选，多件材料只参与分离。19 项上位相关离线检查通过，现场待配对验收。[上位单件实现说明](https://github.com/danmo-teng/shijue_fangan-finals/blob/3829156ba5bc50832ec29ee860e9b6b76a4d4c10/docs/FINALS_SINGLE_ITEM_PLAN.md) · [下位载荷判定](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/4d14c193284b44748395617a00736c369dca24af/Main/Src/Task.c#L791)
 
 以下为随初赛 3024271 复制的历史记录。决赛的当前状态见 [决赛移植说明](FINALS_PORT.md)。
 
