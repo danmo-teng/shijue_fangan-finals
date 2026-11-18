@@ -611,18 +611,18 @@ def test_detour_completion_requires_fresh_changed_ack() -> None:
     assert output.state == CompetitionState.APPROACH
 
 
-def test_initial_stash_requires_one_item_without_changing_its_category_rules() -> None:
+def test_initial_stash_preserves_existing_nonempty_audit_semantics() -> None:
     mission = CompetitionMission(CompetitionSettings(side="red", start_zone=1, initial_stash_enabled=True))
     mission._select_batch(CargoBatch((), (), "stash", initial_stash=True))
-    # FinalRun limits the relocation to one item. Its existing categories are separate from formal scoring.
-    assert mission._audit_valid(CargoAudit(left_class="core_black", left_count=1, total_count=1))
+    # Opening relocation retains its original nonempty-pile rule. Formal
+    # delivery exclusions must not be accidentally imposed on this probe.
     for audit in (
         CargoAudit(left_class="mixed_material", left_count=2, total_count=2),
         CargoAudit(left_class="green_supply", left_count=1,
                    right_class="danger_cyan", right_count=1, total_count=2,
                    danger_present=True),
     ):
-        assert not mission._audit_valid(audit)
+        assert mission._audit_valid(audit)
     assert not mission._audit_valid(CargoAudit())
 
 
@@ -1207,9 +1207,8 @@ def test_4071_separation_evidence_and_fault_latch() -> None:
     mixed = CargoAudit(left_class="mixed_material", left_count=2, left_green_count=1,
                        total_count=2, class_counts=(("green_supply", 1), ("core_black", 1)))
     assert mission._side_is_disperse_candidate(mixed, "left")
-    assert not mission._audit_valid(mixed)
-    assert not mission._side_is_disperse_candidate(replace(mixed, class_counts=()), "left")
-    assert not mission._side_is_disperse_candidate(replace(mixed, unknown_present=True), "left")
+    assert mission._audit_valid(mixed)
+    assert not mission._audit_valid(replace(mixed, unknown_present=True))
     assert mission._side_is_disperse_candidate(replace(mixed, danger_present=True), "left")
     assert not mission._audit_valid(replace(mixed,danger_present=True))
     vote_mission = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
@@ -1232,9 +1231,9 @@ def test_4071_separation_evidence_and_fault_latch() -> None:
     vote_mission.cluster_keep_side = "left"
     vote_mission.cluster_keep_side_count = 0
     curved = vote_mission._start_disperse(greens, stm(mode=37), 1.3)
-    from protocol import CMD_SIDE_VALID, CMD_FIRST_GREEN_BUMP
+    from protocol import CMD_SIDE_VALID, CMD_FIRST_GREEN_BUMP, CMD_TARGET_RIGHT
     assert curved.command.flags & CMD_SIDE_VALID and not curved.command.flags & CMD_FIRST_GREEN_BUMP
-    assert vote_mission.cluster_keep_side_count == 2
+    assert curved.command.flags & CMD_TARGET_RIGHT and vote_mission.cluster_keep_side_count == 1
     mission._observe_disperse_side_vote(1, mixed, 1.0)
     mission._observe_disperse_side_vote(1, mixed, 1.2)
     mission._observe_disperse_side_vote(2, mixed, 1.05)
@@ -1246,6 +1245,8 @@ def test_4071_separation_evidence_and_fault_latch() -> None:
     assert mixed.signature == swapped.signature
     mission._observe_disperse_side_vote(5, swapped, 1.21)
     assert not mission._disperse_side_vote_result()[2]
+    mission.first_common_delivered = False  # Sorting a load that is illegal before the first delivery.
+    assert not mission._audit_valid(mixed) and not mission._audit_valid(swapped)
     mission.cluster_keep_side = "left"
     mission.cluster_keep_side_count = 2
     output = mission._start_disperse(mixed, stm(mode=37), 2.0)
@@ -1261,8 +1262,11 @@ def test_4071_separation_evidence_and_fault_latch() -> None:
     mission._count_separation_acceptance("right")
     assert mission.disperse_attempts == 2 and mission.separation_side_attempts == 1
     output = mission._start_disperse(swapped, stm(mode=37), 2.2)
+    assert output.command.opcode == CMD_DISPERSE_PILE
+    mission._count_separation_acceptance("right")
+    output = mission._start_disperse(swapped, stm(mode=37), 2.3)
     assert output.command.opcode == CMD_RELEASE_BOTH
-    assert mission.disperse_attempts == 2
+    assert mission.disperse_attempts == 3
     legal = CargoAudit(left_class="green_supply", left_count=1, left_green_count=1, total_count=1)
     assert mission._audit_valid(legal)  # A legal result after the second attempt remains eligible for transport.
     same_pile = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
@@ -1970,7 +1974,7 @@ def test_safe_staging_terminal_only_corrects_out_of_window_axes() -> None:
                     assert generic.aux != axial.aux
 
 
-def test_post_first_sorting_prefers_a_legal_singleton_over_multi_item_side() -> None:
+def test_post_first_sorting_prefers_legal_more_green_over_visual_singleton() -> None:
     m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
     m.first_common_delivered = True
     m._select_batch(CargoBatch((10,), ("injured_orange",), "injury"))
@@ -1978,11 +1982,11 @@ def test_post_first_sorting_prefers_a_legal_singleton_over_multi_item_side() -> 
                         left_count=3, right_count=1, left_green_count=3,
                         right_green_count=1, total_count=4)
     for audit, expected in (
-        (greens, "right"),
+        (greens, "left"),
         (replace(greens, left_count=1, right_count=3,
-                 left_green_count=1, right_green_count=3), "left"),
+                 left_green_count=1, right_green_count=3), "right"),
         (replace(greens, right_count=2, right_green_count=2, total_count=5), "left"),
-        (replace(greens, right_isolated_green=True), "right"),
+        (replace(greens, right_isolated_green=True), "left"),
         (replace(greens, right_isolated_green=True, right_count=2,
                  right_green_count=2, total_count=5), "left"),
     ):
@@ -2013,31 +2017,34 @@ def test_progressive_sorting_allows_third_action_and_counts_only_real_attempts()
 
     m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
     m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
-    for attempt, audit in enumerate((greens(3, 2), greens(2, 1), greens(2, 0)), 1):
+    for attempt, audit in enumerate((greens(3, 2), greens(2, 2), greens(0, 2)), 1):
         m.cluster_keep_side = m._preferred_keep_side(audit)
         out = m._start_disperse(audit, stm(mode=37), float(attempt))
         assert out.state == CompetitionState.DISPERSE and out.command.opcode == CMD_DISPERSE_PILE
         assert m.disperse_attempts == attempt - 1  # Sending is not acceptance.
-        m._count_separation_acceptance("left")
-        m._count_separation_acceptance("left")
+        expected_side = "left" if attempt < 3 else "right"
+        assert m.cluster_keep_side == expected_side
+        m._count_separation_acceptance(expected_side)
+        m._count_separation_acceptance(expected_side)
         assert m.disperse_attempts == attempt
         assert not m._separation_limit_reached()  # An unreviewed action is not a failure.
     m._review_separation_result(greens(1, 0))
-    assert m.disperse_attempts == m.separation_progress_attempt == 3
-    assert m._audit_valid(greens(1, 0)) and not m._separation_limit_reached()
+    assert m.disperse_attempts == m.separation_reviewed_attempt == 3
+    assert m._separation_limit_reached()
+    assert m._audit_valid(greens(1, 0)) and not m._separation_should_abandon(greens(1, 0))
     # Repeated planner cycles on the same completed action cannot reset its result.
-    m._review_separation_result(greens(1, 0))
-    assert m.separation_progress_attempt == 3
+    m._review_separation_result(greens(3, 2))
+    assert m.separation_reviewed_attempt == 3
 
     stalled = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
     stalled._select_batch(CargoBatch((1,), ("green_supply",), "material"))
     unchanged = greens(2, 1)
-    for attempt in range(2):
+    for attempt in range(3):
         stalled.cluster_keep_side = "left"
         assert stalled._start_disperse(unchanged, stm(mode=37), float(attempt)).state == CompetitionState.DISPERSE
         stalled._count_separation_acceptance("left")
     out = stalled._start_disperse(unchanged, stm(mode=37), 3.0)
-    assert out.command.opcode == CMD_RELEASE_BOTH and stalled.disperse_attempts == 2
+    assert out.command.opcode == CMD_RELEASE_BOTH and stalled.disperse_attempts == 3
     assert out.state == CompetitionState.INVALID_RELEASE
     # Losing the desired green is not successful reduction of an unwanted group.
     lost = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
@@ -2051,7 +2058,7 @@ def test_progressive_sorting_allows_third_action_and_counts_only_real_attempts()
 
 def test_post_grab_multigreen_reuses_accepted_audit_without_release_backoff() -> None:
     from protocol import CMD_SIDE_VALID
-    for isolated, expected in ((False, "right"), (True, "right")):
+    for isolated, expected in ((False, "left"), (True, "right")):
         m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
         m.first_common_delivered = True
         m._select_batch(CargoBatch((1,), ("injured_orange",), "injury"))
@@ -2144,18 +2151,25 @@ def test_sweep_blue_center_preserves_original_safe_zone_exclusions() -> None:
 
 
 
-def test_post_first_single_item_follows_existing_grab_and_transport() -> None:
+def test_post_first_materials_up_to_three_follow_existing_grab_and_transport() -> None:
     from collections import Counter
     from run_competition_rescue import audit_from_cargo
-    cases = ((("green_supply",), ("left",)), (("core_black",), ("right",)),
-             (("injured_orange",), ("left",)))
+    cases = ((("green_supply", "core_black"), ("left", "left")),
+             (("green_supply", "core_black"), ("left", "right")),
+             (("green_supply", "green_supply"), ("left", "right")),
+             (("core_black", "core_black"), ("right", "right")),
+             (("green_supply",)*3, ("left",)*3),
+             (("core_black",)*3, ("right",)*3),
+             (("green_supply","green_supply","core_black"), ("left",)*3),
+             (("green_supply","core_black","core_black"), ("right",)*3),
+             (("green_supply","green_supply","core_black"), ("left","left","right")),
+             (("green_supply","core_black","core_black"), ("left","right","right")))
     for names, sides, entry_mode in ((n, s, mode) for n, s in cases for mode in (21, 38)):
         items = tuple(cargo(i + 1, name, 460 + 65 * i, 470) for i, name in enumerate(names))
         audit = audit_from_cargo(items, side_by_track=dict(zip(range(1, len(items) + 1), sides)))
         m = CompetitionMission(CompetitionSettings(side="blue", initial_stash_enabled=False))
         m.first_common_delivered = True
-        destination = "injury" if names == ("injured_orange",) else "material"
-        m._select_batch(CargoBatch((1,), (names[0],), destination))
+        m._select_batch(CargoBatch((1,), (names[0],), "material"))
         m.state = CompetitionState.CAPTURE_AUDIT
         assert m._audit_valid(audit)
         m.cluster_audit_active = entry_mode == 38
@@ -2188,6 +2202,11 @@ def test_post_first_single_item_follows_existing_grab_and_transport() -> None:
                                   capture_audit=audit)
             out = m._audit_output(view, replace(stm(mode=23, flags=3),
                                                camera_pitch_cdeg=14000), now)
+        if len(names) >= 2 and names.count("green_supply") >= 2:
+            filtering = m._audit_confirmation_output(
+                view, replace(stm(mode=50, flags=83), camera_pitch_cdeg=14000), 2.25)
+            assert filtering.reason == "post_grab_regrip_wait"
+            assert filtering.command.audit.total_count == len(names)
         acknowledged = replace(relay_stm(out, mode=22, flags=83,
             acknowledged_sequence=3, relay_mission_tx_frames=3),
             camera_pitch_cdeg=14000, context_valid=True, context_matches=True,
@@ -2197,7 +2216,7 @@ def test_post_first_single_item_follows_existing_grab_and_transport() -> None:
         assert m.carried_total_count == len(names)
         assert Counter(m.carried_manifest) == Counter(names)
         assert m.selected_batch.total_count == len(names)
-        assert m.selected_batch.destination == destination
+        assert m.selected_batch.destination == "material"
         assert m.carried_delivery_count() == len(names)
         assert m.carried_delivery_classes() == frozenset(names)
         # At mode48 the same legal batch aligns normally, never separates.
@@ -2218,10 +2237,10 @@ def test_post_first_single_item_follows_existing_grab_and_transport() -> None:
         assert m.carried_total_count == len(names)
 
 
-def test_finals_single_item_policy_keeps_first_ordinary_and_excludes_other_loads() -> None:
+def test_three_material_policy_keeps_first_green_and_excludes_other_loads() -> None:
     from run_competition_rescue import audit_from_cargo
     m = CompetitionMission(CompetitionSettings(side="blue", initial_stash_enabled=False))
-    assert m.settings.max_batch_count == 1
+    assert m.settings.max_batch_count == 3
     m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
     def audited(names):
         items = tuple(cargo(i + 1, name, 450 + 45 * i, 480) for i, name in enumerate(names))
@@ -2235,87 +2254,19 @@ def test_finals_single_item_policy_keeps_first_ordinary_and_excludes_other_loads
     for names in (("green_supply",) * 4, ("injured_orange",) * 2,
                   ("green_supply", "injured_orange"), ("green_supply", "danger_cyan")):
         assert not m._audit_valid(audited(names))
-    for names in (("green_supply",), ("core_black",)):
-        assert m._audit_valid(audited(names))
-    for names in (("green_supply", "core_black"), ("green_supply",) * 2, ("core_black",) * 3):
-        assert not m._audit_valid(audited(names))
-    legal = audited(("core_black",))
+    legal = audited(("green_supply", "core_black"))
     for invalid in (replace(legal, unknown_present=True), replace(legal, left_invalid=True),
-                    replace(legal, total_count=3), replace(legal, left_class="mixed_material"),
-                    replace(legal, injury_mixed=True), replace(legal, left_count=0, right_count=1)):
+                    replace(legal, total_count=3), replace(legal, left_green_count=0)):
         assert not m._audit_valid(invalid)
-    assert not m._side_is_legal_for_task("mixed_material", 2)
+    assert m._side_is_legal_for_task("mixed_material", 2)
     assert not m._side_is_legal_for_task("injured_orange", 2)
-    for invalid_max in (0, 2, 3, 4):
+    for invalid_max in (0, 4):
         try:
             CompetitionSettings(side="red", max_batch_count=invalid_max)
         except ValueError:
             pass
         else:
-            raise AssertionError("finals must always transport one item")
-
-
-def test_finals_multi_item_reaches_existing_separation_without_grab_permission():
-    from protocol import CMD_ALIGN_SAFE_ZONE
-
-    audit = CargoAudit(left_class="green_supply", right_class="green_supply",
-                       left_count=1, right_count=1, left_green_count=1, right_green_count=1, total_count=2)
-    for entry_mode, stash in ((21, False), (38, False), (23, False), (21, True), (23, True)):
-        m = CompetitionMission(CompetitionSettings(side="blue", initial_stash_enabled=stash))
-        m.first_common_delivered = not stash
-        m._select_batch(CargoBatch((1,), ("green_supply",), "stash" if stash else "material",
-                                   initial_stash=stash))
-        m.cluster_audit_active = entry_mode == 38
-        m.post_grab_audit_active = entry_mode == 23
-        m.state = CompetitionState.POST_GRAB_AUDIT if m.post_grab_audit_active else CompetitionState.CAPTURE_AUDIT
-        status = replace(stm(mode=entry_mode, flags=3 if entry_mode == 23 else 1), camera_pitch_cdeg=14000)
-        for frame in (1, 2, 3):
-            now = 1. + frame * .12
-            view = VisionSnapshot(frame_sequence=frame, observed_monotonic_s=now, capture_audit=audit)
-            out = m._audit_output(view, status, now)
-        assert out.command.opcode == CMD_CARGO_AUDIT and out.command.audit.stable
-        assert out.command.audit.total_count == 2 and not m.pending_audit_valid
-        ready = replace(relay_stm(out, mode=37 if entry_mode == 38 else entry_mode,
-                                  flags=67 if entry_mode == 23 else 65), camera_pitch_cdeg=14000)
-        decided = m._audit_confirmation_output(view, ready, 1.37)
-        assert decided.command.opcode in {CMD_DISPERSE_PILE, CMD_RELEASE_BOTH, CMD_RELEASE_LEFT, CMD_RELEASE_RIGHT}
-        assert m.confirmed_load_audit is None
-
-    m, view, current, status = _orange_gate_fixture()
-    out = _orange_gate_confirm_review(m, replace(view, capture_audit=audit, capture_cargo=()),
-                                     current, status)
-    assert out.command.opcode == CMD_DISPERSE_PILE and out.command.opcode != CMD_ALIGN_SAFE_ZONE
-    assert not m._audit_valid(audit)
-
-
-def test_finals_sweep_acknowledges_single_or_uses_the_existing_invalid_exit():
-    from state_machine import SweepPickupContext
-
-    for mode in (43, 45):
-        for count in (1, 2):
-            m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
-            m.first_common_delivered = True
-            m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
-            m._latch_carried_manifest(CargoAudit(left_class="green_supply", left_count=1, total_count=1))
-            m.state = CompetitionState.CLEAR_SAFE_ZONE
-            m.safe_sweep_pickup = SweepPickupContext(2, "green_supply", None, frozenset(),
-                                                    recovering_original=mode == 45)
-            audit = CargoAudit(left_class="green_supply", left_count=count, total_count=count)
-            status = replace(stm(mode=mode, flags=1), camera_pitch_cdeg=14000)
-            for frame in (1, 2, 3):
-                now = 1. + frame * .12
-                view = VisionSnapshot(frame_sequence=frame, observed_monotonic_s=now,
-                                      safe_sweep_capture_audit=audit)
-                out = m._safe_sweep_pickup_output(view, status, now)
-            assert out.command.audit.stable and out.command.audit.total_count == count
-            assert out.command.audit.sweep_pickup == (mode == 43)
-            ready = replace(relay_stm(out, mode=mode, flags=81 if count == 1 else 65),
-                            camera_pitch_cdeg=14000, context_valid=True, context_matches=True,
-                            accepted_command=CMD_CARGO_AUDIT, action_status=1)
-            out = m._safe_sweep_pickup_output(replace(view, frame_sequence=4, observed_monotonic_s=1.48),
-                                            ready, 1.48)
-            expected = CMD_GRAB_CONFIRMED if count == 1 else CMD_HOLD if mode == 43 else CMD_RELEASE_BOTH
-            assert out.command.opcode == expected
+            raise AssertionError("material batch must stay within one to three")
 
 
 def test_two_material_retrieval_keeps_actual_single_remaining():
@@ -3092,10 +3043,10 @@ def test_post_first_orange_preference_preserves_eligibility_and_material_fallbac
     # No continuous reranking when a closer orange appears after locking.
     assert m._target_for_batch(replace(view, cargo=(*view.cargo, cargo(8, "injured_orange", 700, 950)))) == orange_near
     assert m._choose_next_batch(replace(view, cargo=(green, black, *invalid))).track_ids == (green.track_id,)
-    # New selection keeps the real cargo check; all deliveries require one item.
+    # New selection keeps the real cargo check; materials now allow three.
     assert m._audit_valid(CargoAudit(left_class="injured_orange", left_count=1, total_count=1))
     assert not m._audit_valid(CargoAudit(left_class="injured_orange", left_count=2, total_count=2))
-    assert not m._audit_valid(CargoAudit(left_class="green_supply", left_count=3, total_count=3))
+    assert m._audit_valid(CargoAudit(left_class="green_supply", left_count=3, total_count=3))
     # Cargo continuation follows what was actually caught, not the selected ID/class.
     actual = CargoAudit(left_class="core_black", left_count=1, total_count=1)
     assert m._audit_valid(actual)
@@ -4066,11 +4017,11 @@ def test_post_first_separation_prioritizes_no_blue_legal_side_and_tracks_orange_
         names=left+right
         items=tuple(cargo(i+1,n,400+i*40,450) for i,n in enumerate(names))
         return replace(audit_from_cargo(items,side_by_track={i+1:('left' if i<len(left) else 'right') for i in range(len(names))}),stable=True)
-    cases=[(['green_supply'],['green_supply']*3,'left'),
+    cases=[(['green_supply'],['green_supply']*3,'right'),
            (['green_supply','danger_cyan'],['injured_orange'],'right'),
            (['injured_orange'],['green_supply','danger_cyan'],'left'),
            (['green_supply']*3+['core_black'],['green_supply'],'right'),
-           (['green_supply','core_black'],['green_supply']*2,'right'),
+           (['green_supply','core_black'],['green_supply']*2,'left'),
            (['core_black'],['green_supply','danger_cyan'],'left')]
     for left,right,keep in cases:
         m=CompetitionMission(CompetitionSettings(side='red',initial_stash_enabled=False))
@@ -4098,10 +4049,12 @@ def test_post_first_separation_prioritizes_no_blue_legal_side_and_tracks_orange_
     assert m._audit_valid(result)
     m._latch_carried_manifest(result)
     assert m.carried_manifest==('injured_orange',) and m.confirmed_delivery_destination=='injury'
-    # Equal eligible single sides retain the previous side.
-    tie=audit(['green_supply'],['green_supply'])
+    # A valid lock takes precedence over a newly seen higher-priority side.
+    tie=audit(['green_supply'],['injured_orange'])
     m.cluster_keep_side='left';assert m._preferred_keep_side(tie)=='left'
     m.cluster_keep_side='right';assert m._preferred_keep_side(tie)=='right'
+    tie=audit(['green_supply'],['green_supply'])
+    m.cluster_keep_side=None;assert m._preferred_keep_side(tie)=='left'
     # First green still uses the existing green candidate despite a clean orange.
     m.first_common_delivered=False
     m._select_batch(CargoBatch((1,),('green_supply',),'material'))
@@ -4110,9 +4063,9 @@ def test_post_first_separation_prioritizes_no_blue_legal_side_and_tracks_orange_
     first=audit(['green_supply']*3,['green_supply'])
     first=replace(first,right_isolated_green=True)
     assert m._preferred_keep_side(first)=='right'
-    # A multi-item material load remains eligible for separation only.
+    # Legal whole material load still skips separation.
     m.first_common_delivered=True
-    assert not m._audit_valid(audit(['green_supply'],['green_supply']*2))
+    assert m._audit_valid(audit(['green_supply'],['green_supply']*2))
 
 
 def test_first_three_post_green_rounds_scan_orange_then_allow_materials():
@@ -4189,7 +4142,7 @@ def test_orange_separation_tradeoff_is_symmetric_and_never_certifies_mixture():
         for materials in product(('green_supply','core_black'),repeat=n):
             cases.append((['injured_orange'],list(materials),True))
             for mixed in [['injured_orange','core_black'],['injured_orange','green_supply']]:
-                cases.append((mixed,list(materials),True))
+                cases.append((mixed,list(materials),False))
     for left,right,orange_wins in cases:
         for mirror in (False,True):
             a=audited(right,left) if mirror else audited(left,right)
@@ -4228,6 +4181,88 @@ def test_orange_separation_tradeoff_is_symmetric_and_never_certifies_mixture():
     assert not m._orange_core_separation(replace(mixed,unknown_present=True),'left')
     m.first_common_delivered=False
     assert m._preferred_keep_side(mixed)=='right' and not m._orange_core_separation(mixed,'left')
+
+
+def test_finals_questionnaire_mixed_sides_and_single_trials():
+    from run_competition_rescue import audit_from_cargo
+
+    def audited(left, right):
+        items = tuple(cargo(i, name, 400 + 40 * i, 450)
+                      for i, name in enumerate(left + right, 1))
+        sides = {item.track_id: "left" if item.track_id <= len(left) else "right"
+                 for item in items}
+        return replace(audit_from_cargo(items, side_by_track=sides), stable=True)
+
+    def mission():
+        result = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+        result.first_common_delivered = True
+        result._select_batch(CargoBatch((1,), ("green_supply",), "material"))
+        return result
+
+    for mirror in (False, True):
+        green_mix = ["injured_orange", "green_supply"]
+        core_mix = ["injured_orange", "core_black"]
+        audit = audited(core_mix, green_mix) if mirror else audited(green_mix, core_mix)
+        assert mission()._preferred_keep_side(audit) == ("left" if mirror else "right")
+        two_danger = audited(["injured_orange", "danger_cyan"], ["green_supply", "danger_cyan"])
+        assert mission()._start_danger_release(two_danger, stm(mode=37), 1.0).command.opcode == CMD_RELEASE_BOTH
+        for target in ("green_supply", "injured_orange"):
+            m = mission()
+            names = [target, "danger_cyan"]
+            audit = audited([], names) if mirror else audited(names, [])
+            side = "right" if mirror else "left"
+            assert m._start_danger_release(audit, stm(mode=37), 1.0).command.opcode == CMD_DISPERSE_PILE
+            assert m.cluster_keep_side == side
+            m._count_separation_acceptance(side)
+            assert m._start_danger_release(audit, stm(mode=37), 2.0).command.opcode == CMD_RELEASE_BOTH
+            assert not m._separation_should_abandon(audited([target], []))
+
+    three = audited(["injured_orange", "green_supply", "core_black"], [])
+    for result, expected in ((three, CMD_RELEASE_BOTH),
+                             (audited(["injured_orange", "core_black"], []), CMD_DISPERSE_PILE)):
+        m = mission()
+        assert m._start_disperse(three, stm(mode=37), 1.0).command.opcode == CMD_DISPERSE_PILE
+        m._count_separation_acceptance("left")
+        assert m._start_disperse(result, stm(mode=37), 2.0).command.opcode == expected
+
+
+def test_finals_questionnaire_unassigned_keeps_total_and_only_verified_sides_repair_total():
+    from protocol import CMD_SIDE_VALID
+    from run_competition_rescue import audit_from_cargo
+
+    items = (cargo(1, "green_supply", 450, 450), cargo(2, "core_black", 650, 450))
+    assigned = audit_from_cargo(items, side_by_track={1: "left", 2: "right"})
+    wrong_total = replace(assigned, total_count=3)
+    assert VisionSnapshot(capture_audit=wrong_total).capture_audit == assigned
+    assert VisionSnapshot(capture_audit=wrong_total, capture_observation_valid=False).capture_audit == wrong_total
+    unassigned = audit_from_cargo(items, side_by_track={1: "left"})
+    assert VisionSnapshot(capture_audit=unassigned).capture_audit == unassigned
+    assert (unassigned.total_count, unassigned.unassigned_count, unassigned.right_count) == (2, 1, 0)
+    assert unassigned.to_protocol(initial_stash=False, destination="material", audit_id=7).unknown_present
+    m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+    m.first_common_delivered = True
+    m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
+    out = m._observe_unassigned_cargo(unassigned, stm(mode=21), 1.0)
+    assert out.command.opcode == CMD_DISPERSE_PILE and not out.command.flags & CMD_SIDE_VALID
+
+
+def test_finals_questionnaire_first_orange_core_stash_never_marks_delivery():
+    from run_competition_rescue import audit_from_cargo
+
+    m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+    m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
+    audit = audit_from_cargo(
+        (cargo(1, "injured_orange", 450, 450), cargo(2, "core_black", 650, 450)),
+        side_by_track={1: "left", 2: "right"},
+    )
+    status = replace(stm(mode=21, flags=65), camera_pitch_cdeg=14000)
+    for frame in range(1, 5):
+        out = m._audit_output(VisionSnapshot(frame_sequence=frame, capture_audit=audit),
+                              status, float(frame) / 5)
+    assert m.selected_batch.initial_stash and m.selected_batch.destination == "stash"
+    assert m._target_point() == m.settings.stash_point
+    assert out.command.opcode == CMD_CARGO_AUDIT and out.command.audit.total_count == 2
+    assert out.command.audit.initial_stash and not m.first_common_delivered
 
 
 def test_orange_core_uses_ordinary_disperse_and_release():

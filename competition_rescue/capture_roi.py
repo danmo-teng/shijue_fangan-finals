@@ -203,9 +203,6 @@ def capture_side_for_bbox(
     right_valid = bbox_bottom_center_in_roi(bbox, rois.right)
     if left_valid != right_valid:
         return "left" if left_valid else "right"
-    if left_valid and right_valid:
-        x, _, width, _ = bbox
-        return "left" if x + width * 0.5 < CLAW_SPLIT_X else "right"
     return None
 
 

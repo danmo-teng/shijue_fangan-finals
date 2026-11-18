@@ -2510,12 +2510,11 @@ def test_two_material_capture_keeps_full_count_and_existing_wire():
     m = CompetitionMission(CompetitionSettings(side="blue", initial_stash_enabled=False))
     m.first_common_delivered = True
     m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
-    assert not m._audit_valid(audit)
+    assert m._audit_valid(audit)
     frame = m._audit_payload(audit).frame(7)
     assert frame[6] == 6 and frame[7] == 0 and frame[8] == 2 and frame[11] == 2
     m._latch_carried_manifest(audit)
     assert m.carried_total_count == m.selected_batch.total_count == 2
-    assert m.confirmed_load_audit is None
     assert Counter(m.carried_manifest) == Counter({"green_supply": 1, "core_black": 1})
 
 
@@ -2550,7 +2549,7 @@ def test_two_material_delivery_confirmation_requires_both_known_items():
     assert view(known[:1]).delivery_target_inside_safe_zone
 
 
-def test_held_mixture_survives_detector_gap_and_clears_on_physical_separation():
+def test_valid_cargo_audit_uses_current_detections_without_held_mixture_backfill():
     from dataclasses import replace
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -2561,7 +2560,6 @@ def test_held_mixture_survives_detector_gap_and_clears_on_physical_separation():
     m._select_batch(CargoBatch((204,), ("injured_orange",), "injury"))
     m.first_common_delivered = True
     m.state = CompetitionState.POST_GRAB_AUDIT
-    memory = runner_module.HeldCargoEvidence()
     rois = load_capture_rois(PROJECT_ROOT / "vision/config/capture_roi.json")
     orange = TrackedCargo(204, "injured_orange", .85, (528, 167, 402, 318), hits=398)
     green = TrackedCargo(224, "green_supply", .32, (306, 276, 264, 217), hits=91)
@@ -2570,7 +2568,7 @@ def test_held_mixture_survives_detector_gap_and_clears_on_physical_separation():
         with patch.object(runner_module, "tracked_cargo", return_value=items):
             return runner_module.make_vision_snapshot([], [], SimpleNamespace(calibrated=False), None,
                 StmSnapshot(mode=mode, flags=flags, camera_pitch_cdeg=pitch, age_ms=0),
-                m, frame, capture_rois=rois, held_cargo_evidence=memory)
+                m, frame, capture_rois=rois)
 
     observe((orange,), 2900, mode=23)  # Existing camera-ready view; no new waiting.
     m.state = CompetitionState.NAVIGATE
@@ -2579,18 +2577,19 @@ def test_held_mixture_survives_detector_gap_and_clears_on_physical_separation():
     observe((orange,), 3119, flags=2)
     for frame in (3123, 3126):
         actual = observe((orange,), frame)
-        assert actual.capture_audit.total_count == 2 and actual.capture_audit.injury_mixed
-        assert not m._audit_valid(actual.capture_audit)
-        assert actual.capture_cargo == (orange,)  # Not a fabricated detector box.
-        remembered = [d for d in actual.roi_decisions if "remembered_source_frame" in d]
-        assert remembered[0]["remembered_source_frame"] == 3083
+        assert actual.capture_audit.total_count == 1 and not actual.capture_audit.injury_mixed
+        assert m._audit_valid(actual.capture_audit)
+        assert actual.capture_cargo == (orange,)
+        assert not any("remembered_source_frame" in d for d in actual.roi_decisions)
     assert observe((), 3127).capture_audit.total_count == 0
-    observe((orange,), 3128, mode=25, flags=2)  # Actual separation clears old load evidence.
+    mixed = observe((orange, green), 3128)
+    assert mixed.capture_audit.total_count == 2 and mixed.capture_audit.injury_mixed
+    assert not m._audit_valid(mixed.capture_audit)
+    observe((orange,), 3129, mode=25, flags=2)
     clean = observe((orange,), 3130)
     assert clean.capture_audit.total_count == 1 and m._audit_valid(clean.capture_audit)
     observe((orange, green), 3131)
     observe((), 3132, flags=0)
-    assert not memory.items
     # An outside/truncated green cannot create incompatible load evidence.
     outside = replace(green, bbox=(0, 0, 70, 70))
     observe((orange, outside), 3133)
@@ -2889,16 +2888,6 @@ def test_closed_partial_orange_is_mixed_evidence_not_single_injury_permission():
     assert view((green,far),status).capture_audit.total_count==1
     assert view((orange,),status).capture_audit.total_count==0
     assert view((green,replace(orange,inside_safe_zone=True)),status).capture_audit.total_count==1
-    held=runner_module.HeldCargoEvidence()
-    held.observe((green,orange),status,roi,10,'',(orange.track_id,))
-    assert {x.class_name for x,_ in held.missing_incompatible((green,))}=={'injured_orange'}
-    held.observe((green,),replace(status,mode=25),roi,11,'')
-    assert held.missing_incompatible((green,))==()
-    blue=replace(orange,class_name='danger_cyan',bbox=(680,350,120,100))
-    held.observe((green,blue),status,roi,12,'')
-    assert {x.class_name for x,_ in held.missing_incompatible((green,))}=={'danger_cyan'}
-    held.observe((),replace(status,flags=1),roi,13,'')
-    assert held.missing_incompatible((green,))==()
 
 
 def test_locked_single_target_keeps_whole_claw_audit_in_every_view():
@@ -3186,9 +3175,6 @@ def test_only_green_capture_ignores_bottom_point_at_fortyfive_percent_overlap():
         assert snapshot(replace(green,class_name=name)).capture_audit.total_count == 0
     orange = replace(green,class_name="injured_orange",bbox=(150,220,100,100))
     assert snapshot(orange).capture_audit.total_count == 1  # Existing >=80%/centre exception.
-    held = runner_module.HeldCargoEvidence()
-    held.observe((green,),status,rois,10,"")
-    assert "green_supply" in held.items  # No obsolete foot rule in the closed-claw cache.
 
 
 def test_real_platform_core_is_incompatible_only_before_first_green_delivery():
@@ -3797,7 +3783,7 @@ def test_sweep_staging_repair_and_edge_priority_without_pull():
         assert m.obstacle_route.kind=='sweep' and m.obstacle_route.sweep_left_offset_m==.15
 
 
-def test_three_material_wire_preserves_real_green_count_for_separation():
+def test_three_material_wire_preserves_real_green_count_for_filter():
     from dataclasses import replace
     from itertools import product
     from collections import Counter
@@ -3810,7 +3796,7 @@ def test_three_material_wire_preserves_real_green_count_for_separation():
         for sides in product(('left','right'),repeat=3):
             items=tuple(TrackedCargo(i+1,n,.9,(400+i*80,450,60,80),hits=5) for i,n in enumerate(names))
             audit=runner_module.audit_from_cargo(items,side_by_track=dict(zip(range(1,4),sides)))
-            assert not m._audit_valid(audit)
+            assert m._audit_valid(audit)
             packet=m._audit_payload(audit).frame(5)
             assert len(m._audit_payload(audit).semantic_signature[2]) == 8
             assert len(packet)==15 and crc16_modbus(packet[2:12])==int.from_bytes(packet[12:14],'little')
@@ -3827,7 +3813,6 @@ def test_three_material_wire_preserves_real_green_count_for_separation():
             assert green==names.count('green_supply')
             m._latch_carried_manifest(audit)
             assert Counter(m.carried_manifest)==Counter(names) and m.carried_total_count==3
-            assert m.confirmed_load_audit is None
     invalid=replace(audit,left_class='mixed_material',left_count=3,left_green_count=0,right_class='',right_count=0,total_count=3)
     wire=invalid.to_protocol(initial_stash=False,destination='material',audit_id=0)
     assert wire.unknown_present and wire.left_class=='unknown'

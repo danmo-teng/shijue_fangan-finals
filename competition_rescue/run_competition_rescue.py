@@ -442,11 +442,8 @@ def audit_from_cargo(
     side_by_track: dict[int, str] | None = None,
     *,
     isolated_track_ids: set[int] | None = None,
-    remembered_items: tuple[TrackedCargo, ...] = (),
 ) -> CargoAudit | None:
-    # Remembered positives are explicitly supplied only by the closed-load
-    # evidence path. Their detector visibility stays false in snapshots/logs.
-    visible = [item for item in items if item.visible] + list(remembered_items)
+    visible = [item for item in items if item.visible]
     if not visible:
         return CargoAudit()
     side_by_track = side_by_track or {}
@@ -518,6 +515,7 @@ def audit_from_cargo(
             item.class_name == "green_supply" for item in right
         ),
         total_count=len(visible),
+        unassigned_count=len(unassigned),
         danger_present=has_danger,
         unknown_present=bool(all_names - {"green_supply", "core_black", "injured_orange", "danger_cyan"}) or bool(unassigned),
         injury_mixed=injury_mixed,
@@ -888,65 +886,6 @@ def capture_image_quality(image, pixel_format: str, rois: CaptureRois,
     return ""
 
 
-class HeldCargoEvidence:
-    """Positive 140-degree load evidence, scoped to physical claw holding.
-
-    This is not a detector track or a fresh observation. It only prevents an
-    already seen casualty/material mixture becoming legal on missed frames.
-    Opening, releasing or separating the load clears the evidence.
-    """
-
-    HOLD_MODES = frozenset({10, 11, 22, 23, 40, 48, 51})
-
-    def __init__(self):
-        self.items: dict[str, tuple[TrackedCargo, int]] = {}
-        self.view_140_confirmed = False
-
-    def clear(self):
-        self.items.clear()
-        self.view_140_confirmed = False
-
-    def observe(self, cargo, stm, rois, frame_sequence, image_quality_reason, partial_orange_ids=()):
-        if not stm.gripper_closed or stm.mode not in self.HOLD_MODES:
-            self.clear()
-            return
-        if stm.camera_pitch_cdeg != 14000:
-            self.view_140_confirmed = False
-            return
-        if stm.claw_visible:
-            self.view_140_confirmed = True
-        if not self.view_140_confirmed or image_quality_reason:
-            return
-        for item in cargo:
-            if (not item.visible or item.hits < 2 or
-                    item.class_name not in {"green_supply", "core_black", "injured_orange", "danger_cyan"}):
-                continue
-            if item.track_id in partial_orange_ids:
-                self.items[item.class_name]=(item,frame_sequence)
-                continue
-            x, y, width, height = item.bbox
-            if (x <= 0 or y <= 0 or x + width >= IMAGE_WIDTH - 1 or
-                    y + height >= IMAGE_HEIGHT - 1):
-                continue
-            if bbox_in_capture_roi(item.bbox, rois.overall, minimum_overlap_ratio=capture_overlap_for_class(item.class_name),
-                                   require_bottom_center=item.class_name != "green_supply"):
-                self.items[item.class_name] = (item, frame_sequence)
-
-    def missing_incompatible(self, current):
-        classes = {item.class_name for item in current}
-        combined = classes | self.items.keys()
-        mixed_injury = ('injured_orange' in combined and
-                        bool(combined.intersection({'green_supply','core_black'})))
-        mixed_danger = ('danger_cyan' in combined and
-                        bool(combined.intersection({'green_supply','core_black','injured_orange'})))
-        if not current or not (mixed_injury or mixed_danger):
-            return ()
-        # Keep one actual positive example of each missing incompatible class;
-        # never extrapolate counts or manufacture cargo in an empty picture.
-        return tuple((replace(item, visible=False), frame)
-                     for name, (item, frame) in self.items.items() if name not in classes)
-
-
 def partial_orange_mixed_evidence(cargo, capture, polygon):
     """Contact evidence for closed-claw separation, never single-injury permission."""
     materials = [item for item in capture if item.class_name in MATERIAL_CLASSES]
@@ -1008,7 +947,6 @@ def make_vision_snapshot(
     recent_carried_track_ids: tuple[int, ...] = (),
     recent_corridor_obstacle: TrackedCargo | None = None,
     recent_carried_pitch_cdeg: int = 0,
-    held_cargo_evidence: HeldCargoEvidence | None = None,
     grip_bands: GripBands | None = None,
     safe_zone_memory: SafeZoneCargoMemory | None = None,
     black_delivery: SingleBlackDelivery | None = None,
@@ -1049,11 +987,10 @@ def make_vision_snapshot(
                                  not capture_quality_reason)
     image_observation_valid = capture_observation_valid
     image_quality_reason = capture_quality_reason
-    claw_cargo = tracked_cargo(tracks, None) if capture_enabled or held_cargo_evidence is not None else ()
     target_quality: dict[int, str] = {}
     roi_decisions = []
     if capture_enabled:
-        for item in claw_cargo:
+        for item in tracked_cargo(tracks, None):
             if not item.visible:
                 continue
             x, y, width, height = item.bbox
@@ -1090,33 +1027,21 @@ def make_vision_snapshot(
                 minimum_overlap_ratio=capture_overlap,
                 overall_included=included,
             )
-            capture_side_by_track[item.track_id] = capture_side or (
-                "left" if item.center_px[0] <= IMAGE_WIDTH // 2 else "right"
-            )
             if capture_side is not None:
+                capture_side_by_track[item.track_id] = capture_side
                 capture_explicit_sides[item.track_id] = capture_side
     partial_orange_ids = set()
     if capture_enabled and stm.gripper_closed:
         for item in partial_orange_mixed_evidence(cargo,capture_items,rois.overall):
             capture_items.append(item);partial_orange_ids.add(item.track_id)
-            capture_side_by_track[item.track_id] = 'left' if item.center_px[0] <= IMAGE_WIDTH//2 else 'right'
+            side = capture_side_for_bbox(item.bbox, rois, overall_included=True)
+            if side is not None:
+                capture_side_by_track[item.track_id] = side
+                capture_explicit_sides[item.track_id] = side
             for decision in roi_decisions:
                 if decision['track_id']==item.track_id:
                     decision.update(included=True,reason='partial_orange_mixed_separation_only',transport_eligible=False)
     capture = tuple(capture_items)
-    remembered_capture = ()
-    if held_cargo_evidence is not None:
-        held_cargo_evidence.observe(claw_cargo, stm, rois,
-                                   frame_sequence, image_quality_reason, partial_orange_ids)
-        if capture_enabled and capture_observation_valid:
-            remembered_capture = held_cargo_evidence.missing_incompatible(capture)
-            for item, source_frame in remembered_capture:
-                capture_side_by_track[item.track_id] = capture_side_for_bbox(
-                    item.bbox, rois, minimum_overlap_ratio=0.60, overall_included=True,
-                ) or ("left" if item.center_px[0] <= IMAGE_WIDTH // 2 else "right")
-                roi_decisions.append(dict(track_id=item.track_id, **{"class": item.class_name},
-                    included=True, reason="held_incompatible_cargo_remembered",
-                    remembered_source_frame=source_frame))
     for index, item in enumerate(capture):
         for other in capture[index + 1:]:
             if item.track_id in partial_orange_ids or other.track_id in partial_orange_ids:
@@ -1165,7 +1090,6 @@ def make_vision_snapshot(
                     not mission._boxes_overlap(item.bbox, other.bbox)
                     for other in capture)
             },
-            remembered_items=tuple(item for item, _ in remembered_capture),
         )
         if capture_observation_valid else None
     )
@@ -1199,8 +1123,7 @@ def make_vision_snapshot(
     sweep_observation_valid = capture_observation_valid
     sweep_quality_reason = capture_quality_reason
     sweep_audit = (
-        audit_from_cargo(sweep_capture, set(), capture_side_by_track,
-                         remembered_items=tuple(item for item, _ in remembered_capture))
+        audit_from_cargo(sweep_capture, set(), capture_side_by_track)
         if sweep_observation_valid and mission.safe_sweep_pickup is not None else None
     )
     if sweep_audit is not None and near_hint is not None:
@@ -3732,7 +3655,6 @@ def main() -> int:
     recent_carried_bboxes: tuple[tuple[int, int, int, int], ...] = ()
     recent_carried_track_ids: tuple[int, ...] = ()
     recent_carried_pitch_cdeg = 0
-    held_cargo_evidence = HeldCargoEvidence()
     safe_zone_memory = SafeZoneCargoMemory()
     black_delivery = SingleBlackDelivery()
     competition_started = False
@@ -3822,7 +3744,6 @@ def main() -> int:
         recent_carried_bboxes = ()
         recent_carried_track_ids = ()
         recent_carried_pitch_cdeg = 0
-        held_cargo_evidence.clear()
         safe_zone_memory.clear()
         black_delivery.owner = None
         startup_details.update(side=side,start_zone=start_zone,opening_strategy=opening_strategy,
@@ -4120,7 +4041,6 @@ def main() -> int:
                     grip_bands=grip_bands,
                     recent_carried_track_ids=recent_carried_track_ids,
                     recent_carried_pitch_cdeg=recent_carried_pitch_cdeg,
-                    held_cargo_evidence=held_cargo_evidence,
                     safe_zone_memory=safe_zone_memory, black_delivery=black_delivery,
                 )
                 if latest_vision.carried_reference_track_ids:
