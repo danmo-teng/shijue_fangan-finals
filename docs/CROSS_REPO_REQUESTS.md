@@ -1,6 +1,10 @@
 # 两端最新修改要求（初赛基线存档）
 
-决赛上位已经完成第一阶段的分离发令调整。[单件运输适配范围](FINALS_SINGLE_ITEM_PLAN.md)保留待核对的下位动作及单件入口。用户指定下位仓库为 `kkkkkkkkkkkkkkkk222222/Final_Run`，当前访问返回 404。需以该仓库实际代码判断哪些配套已完成，当前无针对旧初赛固件的新实施要求。
+## FINALS-SINGLE-ITEM 决赛第一批已核对，第二批待两端配套
+
+下位决赛基线为 `Final_Run` 的 `Final_task@fd63ab7e62e97630ee4625facc3ad20e99278e6d`。`FinalRun` 预设已有 `APP_ENABLE_POST_GRAB_FILTER=0`，保留必要重新合爪及合法审核的原出口。上位 `389c34f` 停止发出 `U=8200`、门口横移滤除与首件撞堆。下位现有普通分离接 `U=0`，按保留侧开另一爪，恢复 140° 画面并清旧审核；两端沿用同一动作身份。7 项上位离线检查通过，板端版本及实车分离待验。[下位构建配置](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/CMakeLists.txt#L55) · [下位分离交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/Main/Src/Task.c#L6728)
+
+第二批范围待评审。下位 `task_audit_semantic` 首件后仍认可两三件材料，还会拒绝对该合法批次发出的普通分离。决赛预设应与上位统一为恰好一件才可运输，保留实际数量用于非法审核与分离。`INITIAL_STASH` 和 `SWEEP_PICKUP` 的非空即通过各有独立入口，需同批核对。保持现有报文和正常恢复，初赛固件沿用自己的规则。详细范围见[决赛单件运输适配](FINALS_SINGLE_ITEM_PLAN.md)。[下位载荷判定](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/fd63ab7e62e97630ee4625facc3ad20e99278e6d/Main/Src/Task.c#L819)
 
 以下为随初赛 3024271 复制的历史记录。决赛的当前状态见 [决赛移植说明](FINALS_PORT.md)。
 
