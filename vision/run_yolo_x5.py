@@ -40,6 +40,16 @@ LABEL_ALIASES = {
 }
 
 
+CARGO_DISPLAY_NAMES = {
+    "green_supply": "ordinary", "core_black": "core",
+    "injured_orange": "casualty", "danger_cyan": "hazard",
+}
+
+
+def display_class(class_name: str) -> str:
+    return CARGO_DISPLAY_NAMES.get(class_name, class_name)
+
+
 @dataclass(frozen=True)
 class YoloDetection:
     class_id: int
@@ -411,7 +421,7 @@ def draw(image: np.ndarray, detections: list[YoloDetection], timing: dict[str, f
         cv2.rectangle(view, (x, y), (x + width, y + height), color, 3)
         center = detection.center
         cv2.drawMarker(view, center, color, cv2.MARKER_CROSS, 18, 2)
-        label = f"{detection.class_name} {detection.confidence:.2f} ({center[0]},{center[1]})"
+        label = f"{display_class(detection.class_name)} {detection.confidence:.2f} ({center[0]},{center[1]})"
         cv2.putText(view, label, (x, max(28, y - 8)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.62, color, 2, cv2.LINE_AA)
     status = (

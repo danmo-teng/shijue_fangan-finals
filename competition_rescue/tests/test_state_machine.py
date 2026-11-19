@@ -1245,7 +1245,6 @@ def test_4071_separation_evidence_and_fault_latch() -> None:
     vote_mission.separation_keep_side = "right"
     tied = replace(greens, left_count=1, left_green_count=1, total_count=2)
     assert vote_mission._preferred_keep_side(tied) == "right"
-    assert not vote_mission._should_first_green_bump(greens)
     vote_mission._observe_disperse_side_vote(1, greens, 1.0)
     vote_mission._observe_disperse_side_vote(2, greens, 1.09)
     assert not vote_mission._disperse_side_vote_result()[2]
@@ -1995,7 +1994,7 @@ def test_safe_staging_terminal_only_corrects_out_of_window_axes() -> None:
                     assert generic.aux != axial.aux
 
 
-def test_post_first_sorting_prefers_legal_more_green_over_visual_singleton() -> None:
+def test_post_first_sorting_prefers_explicit_singleton_within_same_class() -> None:
     m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
     m.first_common_delivered = True
     m._select_batch(CargoBatch((10,), ("injured_orange",), "injury"))
@@ -2003,11 +2002,11 @@ def test_post_first_sorting_prefers_legal_more_green_over_visual_singleton() -> 
                         left_count=3, right_count=1, left_green_count=3,
                         right_green_count=1, total_count=4)
     for audit, expected in (
-        (greens, "left"),
+        (greens, "right"),
         (replace(greens, left_count=1, right_count=3,
-                 left_green_count=1, right_green_count=3), "right"),
+                 left_green_count=1, right_green_count=3), "left"),
         (replace(greens, right_count=2, right_green_count=2, total_count=5), "left"),
-        (replace(greens, right_isolated_green=True), "left"),
+        (replace(greens, right_isolated_green=True), "right"),
         (replace(greens, right_isolated_green=True, right_count=2,
                  right_green_count=2, total_count=5), "left"),
     ):
@@ -2020,7 +2019,7 @@ def test_post_first_sorting_prefers_legal_more_green_over_visual_singleton() -> 
     assert m._preferred_keep_side(mixed) == "right"
     assert not m._audit_payload(mixed).destination_injury
     generation = m.task_generation
-    m._prefer_green_batch(mixed)
+    m._select_separation_cargo(mixed)
     assert m.selected_batch.destination == "material"
     assert m.selected_batch.classes == ("green_supply",)
     assert m.task_generation == generation  # No new task/handshake to change sorting priority.
@@ -2076,7 +2075,7 @@ def test_progressive_sorting_allows_third_action_and_counts_only_real_attempts()
 
 def test_post_grab_multigreen_reuses_accepted_audit_without_release_backoff() -> None:
     from protocol import CMD_SIDE_VALID
-    for isolated, expected in ((False, "left"), (True, "right")):
+    for isolated, expected in ((False, "right"), (True, "right")):
         m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
         m.first_common_delivered = True
         m._select_batch(CargoBatch((1,), ("injured_orange",), "injury"))
@@ -2807,9 +2806,10 @@ def test_blue_with_recoverable_cargo_uses_existing_disperse_without_rearming():
         left_green_count=1,danger_present=True,left_invalid=True,
         left_class_counts=(('green_supply',1),('danger_cyan',1)),
         class_counts=(('green_supply',1),('danger_cyan',1)),stable=True)
-    from protocol import RELEASE_SAME_SIDE_BLUE
+    from protocol import CMD_SIDE_VALID
     out = m._start_danger_release(same,s,2.)
-    assert out.command.opcode == CMD_RELEASE_BOTH and out.command.aux == RELEASE_SAME_SIDE_BLUE
+    assert out.command.opcode == CMD_DISPERSE_PILE and out.command.flags & CMD_SIDE_VALID
+    assert not out.command.flags & CMD_TARGET_RIGHT and out.command.aux == 0
     only=CargoAudit(left_class='danger_cyan',left_count=1,total_count=1,danger_present=True,stable=True)
     assert not m._side_is_disperse_candidate(only,'left')  # No useful cargo to retain.
 
@@ -3242,11 +3242,11 @@ def test_opening_attack_return_requires_paired_done_for_each_leg_and_search_read
             assert m.step(v,replace(q,valid=False),done,1.2).command.arg_a==-100
             out=m.step(v,q,done,1.3)
             assert r.index==1 and out.command.flags>>4==13
-            assert m.step(v,q,done,1.4).command.arg_a>0 and r.index==1
-            q=replace(q,x_m=r.return_point[0])
+            assert m.step(v,q,replace(done,action_status=1),1.4).command.arg_a>0 and r.index==1
+            q=replace(q,x_m=r.return_point[0]+.06)  # wheel DONE, lateral residual remains
             out=m.step(v,q,done,1.5)
             assert r.index==2 and out.command.flags>>4==13
-            at=replace(q,y_m=0.)
+            at=replace(q,x_m=r.return_point[0],y_m=0.)
             out=m.step(v,at,done,1.6)
             assert r.index==3 and out.command.flags>>4==14
             assert m.step(v,at,replace(done,context_matches=False),1.7).command.flags>>4==14
@@ -3257,11 +3257,37 @@ def test_opening_attack_return_requires_paired_done_for_each_leg_and_search_read
             assert out.state==CompetitionState.SEARCH and m.search_point_number==1
             assert m.return_search_frame_floor==21
 
-    defense=CompetitionMission(CompetitionSettings(side='red',opening_strategy='defense'))
-    defense._select_batch(CargoBatch((1,),('green_supply',),'stash',initial_stash=True))
-    defense._set_state(CompetitionState.INITIAL_RELEASE,1.)
-    out=defense.step(VisionSnapshot(),pose(),release,1.)
-    assert out.state==CompetitionState.RETURN_CENTER and out.command.opcode==CMD_RETURN_CENTER
+
+def test_defense_release_backs_off_locally_before_direct_transfer_to_one():
+    import math
+    from protocol import CMD_BULLDOZER_STEP
+    for side in ("red", "blue"):
+        for zone in (1, 2, 3, 4):
+            m = CompetitionMission(CompetitionSettings(side=side, start_zone=zone, opening_strategy="defense"))
+            m._select_batch(CargoBatch((1,), ("green_supply",), "stash", initial_stash=True))
+            m._set_state(CompetitionState.INITIAL_RELEASE, 1.)
+            release = StmSnapshot(mode=34, flags=0, age_ms=0, context_valid=True, context_matches=True,
+                                  accepted_command=CMD_RELEASE_BOTH, action_status=3)
+            v = VisionSnapshot()
+            at = pose(*m.settings.stash_point)
+            out = m.step(v, at, release, 1.1)
+            assert m.initial_stash_done and m.return_search_station == 1
+            assert out.command.opcode == CMD_RETURN_CENTER and out.command.arg_a == 0
+            # A remembered pose at the centre or the previous batch's DONE cannot start the move.
+            returning = replace(release, mode=17, accepted_command=CMD_RETURN_CENTER, action_status=1)
+            assert m.step(v, at, returning, 1.2).command.arg_a == 0
+            done = replace(returning, mode=3, action_status=3)
+            assert m.step(v, at, replace(done, context_matches=False), 1.3).state == CompetitionState.RETURN_CENTER
+            # Historical blue/1 release heading was about 230 degrees; route uses the new live pose.
+            after = replace(at, x_m=at.x_m+.20, y_m=at.y_m+.27, yaw_deg=230.)
+            out = m.step(v, after, done, 1.4)
+            target = m.settings.search_point(1)
+            assert out.state == CompetitionState.SEARCH_TRANSFER and out.command.opcode == CMD_BULLDOZER_STEP
+            assert out.command.flags >> 4 == 13 and out.command.aux == 23000
+            assert m.search_transfer_route.waypoints == (target,)
+            assert out.command.arg_a == round(1000*math.hypot(target[0]-after.x_m, target[1]-after.y_m))
+            assert m.delivery_count == 0 and not m.first_common_delivered
+
 
 
 def test_search_stations_one_and_three_alternate_directly_for_all_starts():
@@ -3310,7 +3336,7 @@ def test_saved_search_station_does_not_skip_retrieval_after_obstacle_delivery():
         (-.15, -.54), (-.29, -.51), ('injured_orange',), 'pickup', recover_after_delivery=True)
     status = StmSnapshot(mode=17, age_ms=0, context_valid=True, context_matches=True,
         accepted_command=CMD_RETURN_CENTER, action_status=1)
-    m._begin_return(status, 1., after_delivery=True)
+    m._begin_return(status, 1., station=m.delivery_search_point_number)
     m.step(VisionSnapshot(), pose(), status, 1.1)
     out = m.step(VisionSnapshot(), pose(), replace(status, mode=3), 1.2)
     assert out.state == CompetitionState.OBSTACLE_ROUTE
@@ -3899,21 +3925,31 @@ def test_closed_gap_reappearance_and_pause_do_not_discard_real_evidence():
     assert result.reason == 'confirmed_load_gap_resume'
 
 
-def test_distant_zone_target_uses_stationary_recovery_before_any_range_move():
+def test_locked_zone_target_reviews_without_release_before_any_range_move():
+    from protocol import CMD_APPROACH_RANGE
     for state in (CompetitionState.APPROACH, CompetitionState.CLUSTER_APPROACH):
-        m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
-        m.first_common_delivered = True
-        m._select_batch(CargoBatch((594,), ("injured_orange",), "injury"))
-        m.locked_target_track_id = m.cluster_target_track_id = 594
-        m._set_state(state, 1.)
-        item = replace(cargo(594, "injured_orange", 779, 195), inside_safe_zone=True)
-        view = VisionSnapshot(frame_sequence=8214, cargo=(item,), range_pitch_cdeg=10500)
-        st = replace(stm(mode=20), camera_pitch_cdeg=10500)
-        out = m.step(view, pose(), st, 1.1)
-        assert out.reason == "safe_zone_target_reselect" and out.command.opcode == CMD_HOLD
-        assert m.state == CompetitionState.WAIT_SEARCH_RECOVERY and m.selected_batch is None
-        assert m.step(view, pose(), replace(st, mode=24), 1.2).command.opcode == CMD_HOLD
-        assert m.step(view, pose(), replace(st, mode=3), 1.3).state == CompetitionState.SEARCH
+        for name, pitch in (("green_supply",12000), ("injured_orange",10500)):
+            m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+            m.first_common_delivered = True
+            m._select_batch(CargoBatch((56,), (name,), "injury" if name == "injured_orange" else "material"))
+            m.locked_target_track_id = m.cluster_target_track_id = 56
+            m._set_state(state, 1.)
+            m.search_site_turn_deg = m.search_yaw_accum_deg = 535.
+            item = replace(cargo(56, name, 779, 195), inside_safe_zone=True, safe_zone_name="safe_blue")
+            view = VisionSnapshot(frame_sequence=8263, cargo=(item,), range_pitch_cdeg=pitch)
+            old = replace(stm(mode=3), camera_pitch_cdeg=pitch, context_valid=True, action_status=3)
+            out = m.step(view, pose(), old, 1.1)
+            assert out.reason == "zone_view_align" and out.command.opcode == CMD_APPROACH_TARGET
+            assert not out.command.flags & CMD_APPROACH_RANGE
+            paired = replace(old, mode=52, context_matches=True, accepted_command=CMD_APPROACH_TARGET)
+            out = m.step(replace(view,frame_sequence=8264),pose(),paired,1.2)
+            assert (out.command.arg_a,out.command.arg_b,out.command.aux)==(0,10500,3)
+            high = replace(paired,camera_pitch_cdeg=10500)
+            m.step(replace(view,frame_sequence=8265),pose(),high,1.3)
+            frame = replace(view,frame_sequence=8266,range_pitch_cdeg=10500,observed_monotonic_s=1.4)
+            assert m.step(frame,pose(),high,1.4).command.opcode==CMD_HOLD
+            assert m.step(frame,pose(),replace(high,mode=3),1.5).state==CompetitionState.SEARCH
+            assert m.search_site_turn_deg == 535.
 
 
 def test_safe_zone_target_cancels_before_finite_range_resend_and_waits_for_recovery():
@@ -3933,8 +3969,12 @@ def test_safe_zone_target_cancels_before_finite_range_resend_and_waits_for_recov
         assert m.range_command is None
         again = m.step(replace(v, cargo=(), frame_sequence=11), pose(), stm(53), 1.1)
         assert again.command.opcode == CMD_RELEASE_BOTH
-        m.step(v, pose(), stm(24), 1.2)
-        m.step(v, pose(), stm(3), 1.8)
+        old = replace(stm(3),context_valid=True,context_matches=False,accepted_command=CMD_APPROACH_TARGET,action_status=3)
+        assert m.step(v,pose(),old,1.15).command.opcode==CMD_RELEASE_BOTH
+        ack = replace(old,context_matches=True,accepted_command=CMD_RELEASE_BOTH,action_status=1)
+        assert m.step(v,pose(),replace(ack,mode=24),1.2).command.opcode==CMD_HOLD
+        assert m.state==CompetitionState.INVALID_RELEASE
+        m.step(v,pose(),replace(ack,action_status=3),1.8)
         assert m.state == CompetitionState.SEARCH and m.selected_batch is None
 
 
@@ -4000,7 +4040,7 @@ def test_new_orange_never_reranks_locked_green_and_missing_green_is_not_orange()
     m._select_batch(CargoBatch((green.track_id,),('green_supply',),'material'))
     m.locked_target_track_id=green.track_id
     m._mark_target_seen(green,1.)
-    assert m._choose_search_target(VisionSnapshot(cargo=(green,orange)))==orange
+    assert m._choose_search_target(VisionSnapshot(cargo=(green,orange)))==green
     assert m._target_for_batch(VisionSnapshot(cargo=(green,orange)))==green
     assert m._target_for_batch(VisionSnapshot(cargo=(orange,))) is None
     assert m.selected_batch.track_ids==(green.track_id,)
@@ -4065,7 +4105,7 @@ def test_post_first_separation_prioritizes_no_blue_legal_side_and_tracks_orange_
         names=left+right
         items=tuple(cargo(i+1,n,400+i*40,450) for i,n in enumerate(names))
         return replace(audit_from_cargo(items,side_by_track={i+1:('left' if i<len(left) else 'right') for i in range(len(names))}),stable=True)
-    cases=[(['green_supply'],['green_supply']*3,'right'),
+    cases=[(['green_supply'],['green_supply']*3,'left'),
            (['green_supply','danger_cyan'],['injured_orange'],'right'),
            (['injured_orange'],['green_supply','danger_cyan'],'left'),
            (['green_supply']*3+['core_black'],['green_supply'],'right'),
@@ -4108,7 +4148,7 @@ def test_post_first_separation_prioritizes_no_blue_legal_side_and_tracks_orange_
     assert not m._audit_payload(a).destination_injury
     first=audit(['green_supply']*3,['green_supply'])
     first=replace(first,right_isolated_green=True)
-    assert m._preferred_keep_side(first)=='left'
+    assert m._preferred_keep_side(first)=='right'
     for pure, mixed in [(['green_supply'], ['green_supply']*2+['injured_orange']),
                         (['green_supply']*2, ['injured_orange'])]:
         assert m._preferred_keep_side(audit(pure,mixed))=='left'
@@ -4385,3 +4425,122 @@ def test_empty_stations_one_and_three_both_switch_at_540():
     m.search_site_turn_deg = 540
     m._handle_search(high,at,ready,1.7)
     assert m.search_transfer_route.target_point == 1 and not m.search_transfer_route.high_start
+
+
+def test_visible_first_green_stops_after_five_accepted_separations():
+    from run_competition_rescue import audit_from_cargo
+    m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+    m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
+    g, black = cargo(1, "green_supply", 450, 400), cargo(2, "core_black", 800, 400)
+    a = audit_from_cargo((g, black), side_by_track={1:"left",2:"right"})
+    for attempts in (2, 3, 4, 5, 6):
+        m.disperse_attempts = m.separation_reviewed_attempt = attempts
+        assert m._separation_limit_reached(a) == (attempts >= 5)
+    m.disperse_attempts = m.separation_reviewed_attempt = 2
+    assert m._separation_limit_reached(audit_from_cargo((black,), side_by_track={2: "right"}))
+    m.first_common_delivered = True
+    assert m._separation_limit_reached(a)
+
+
+
+def test_pregrab_lost_green_with_visible_replacement_relooks_in_place():
+    from protocol import APPROACH_PRE_GRAB_RELOOK
+    m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False, pre_grab_advance_enabled=True))
+    m._select_batch(CargoBatch((277,), ("green_supply",), "material"))
+    m._set_state(CompetitionState.CAPTURE_AUDIT,1.)
+    s = replace(stm(mode=21, flags=1), camera_pitch_cdeg=14000)
+    v = VisionSnapshot(frame_sequence=4248, cargo=(cargo(281,"green_supply",818,44),),
+                       capture_audit=CargoAudit(),pre_grab_configured_classes=("green_supply",))
+    out = m._pre_grab_depth_output(v,s,2.)
+    assert (out.command.aux,out.command.arg_a,out.command.arg_b)==(APPROACH_PRE_GRAB_RELOOK,0,12000)
+    out.command.to_frame(1)
+    accepted=replace(s,mode=3,camera_pitch_cdeg=12000,context_valid=True,context_matches=True,
+                     accepted_command=CMD_APPROACH_TARGET,action_status=1)
+    m._pre_grab_advance_output(v,accepted,3.)
+    assert m.state == CompetitionState.SEARCH and m.selected_batch is None
+
+
+
+def test_blue_side_priority_counts_only_eligible_cargo_before_tiebreak():
+    from run_competition_rescue import audit_from_cargo
+    m = CompetitionMission(CompetitionSettings(side="blue", initial_stash_enabled=False))
+    m._select_batch(CargoBatch((1,), ("green_supply",), "material"))
+    def audit(left,right):
+        pairs=[(side,name) for side,group in (("left",left),("right",right)) for name in group]
+        return audit_from_cargo(tuple(cargo(i,name,200 if side=="left" else 900,300)
+            for i,(side,name) in enumerate(pairs)),side_by_track={i:side for i,(side,_) in enumerate(pairs)})
+    b,g,k,o="danger_cyan","green_supply","core_black","injured_orange"
+    for first_done in (False, True):
+        m.first_common_delivered=first_done
+        assert m._preferred_keep_side(audit([b,g,g],[g]))=="right"
+        assert m._preferred_keep_side(audit([g],[b,g,g]))=="left"
+        assert m._preferred_keep_side(audit([b,k,o],[b,g]))==("left" if first_done else "right")
+
+
+def test_finals_actual_separated_load_owns_destination_and_identity():
+    from run_competition_rescue import audit_from_cargo
+    ordinary, core, casualty = "green_supply", "core_black", "injured_orange"
+    for first_done, approach, contents, destination in (
+        (False, ordinary, (ordinary,), "material"),
+        (False, ordinary, (core,), None),
+        (False, ordinary, (casualty,), None),
+        (False, ordinary, (ordinary, ordinary), None),
+        (True, core, (casualty,), "injury"),
+        (True, casualty, (core,), "material"),
+        (True, core, (ordinary,), "material"),
+        (True, casualty, (ordinary, core, core), "material"),
+        (True, ordinary, (ordinary, casualty), None),
+        (True, casualty, (casualty, casualty), None),
+        (True, core, (ordinary, "danger_cyan"), None),
+        (True, core, (ordinary,) * 4, None),
+    ):
+        m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+        m.first_common_delivered = first_done
+        m._select_batch(CargoBatch((7,), (approach,), "injury" if approach == casualty else "material"))
+        m.disperse_attempts = 1 if first_done else 5
+        items = tuple(cargo(40+i, kind, 440+40*i, 550) for i, kind in enumerate(contents))
+        audit = audit_from_cargo(items, selected_ids={7}, side_by_track={c.track_id:"left" for c in items})
+        assert m._audit_valid(audit) == (destination is not None)
+        assert m._cluster_audit_valid(audit) == (destination is not None)
+        if destination is None:
+            assert m.confirmed_delivery_destination is None
+            if not first_done:
+                out = m._start_disperse(audit, stm(mode=37), 1.)
+                assert out.command.opcode == CMD_RELEASE_BOTH and m.disperse_attempts == 5
+            continue
+        assert m._audit_payload(audit).destination_injury == (destination == "injury")
+        m._begin_post_grab_audit(VisionSnapshot(frame_sequence=1), 1.)
+        for frame in (2, 3, 4):
+            now = 1. + frame * .12
+            view = VisionSnapshot(frame_sequence=frame, observed_monotonic_s=now, capture_audit=audit)
+            out = m._audit_output(view, replace(stm(mode=23, flags=3), camera_pitch_cdeg=14000), now)
+        ack = replace(relay_stm(out, mode=22, flags=83), camera_pitch_cdeg=14000,
+                      context_valid=True, context_matches=True, accepted_command=CMD_CARGO_AUDIT, action_status=1)
+        out = m._audit_confirmation_output(view, ack, now+.01)
+        assert out.reason == "post_grab_audit_confirmed"
+        assert m.confirmed_delivery_destination == m.selected_batch.destination == destination
+        assert m.selected_batch.track_ids == tuple(c.track_id for c in items)
+        assert sorted(m.selected_batch.classes) == sorted(contents)
+        assert m._target_point() == (m.settings.injury_target_x_m if destination == "injury"
+                                     else m.settings.material_target_x_m, m.settings.safe_staging_y_m)
+        assert m.first_common_delivered == first_done
+
+
+def test_finals_no_view_turn_with_or_without_an_identified_retention_side():
+    from protocol import CMD_SIDE_VALID
+    from run_competition_rescue import audit_from_cargo
+    for types, sides, expected in (
+        (("green_supply", "green_supply"), {1:"left", 2:"right"}, "left"),
+        (("green_supply", "danger_cyan"), {1:"right", 2:"right"}, "right"),
+        (("green_supply", "danger_cyan"), {}, None),
+    ):
+        m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+        m._select_batch(CargoBatch((7,), ("green_supply",), "material"))
+        items = tuple(cargo(i+1, kind, 620, 500) for i, kind in enumerate(types))
+        out = m._start_disperse(audit_from_cargo(items, side_by_track=sides), stm(mode=37), 1.)
+        assert out.command.aux == 0
+        if expected is None:
+            assert out.command.opcode == CMD_RELEASE_BOTH
+        else:
+            assert out.command.opcode == CMD_DISPERSE_PILE and out.command.flags & CMD_SIDE_VALID
+            assert bool(out.command.flags & CMD_TARGET_RIGHT) == (expected == "right")

@@ -244,7 +244,7 @@ class CompetitionMapApp(RescueMapApp):
                     self.operator.silence()
                     self.trajectory.reset()
                     self.odometry_trajectory.reset()
-                    self.message = '已请求本局重发，按原出发位重设定位，保留首绿和进攻进度'
+                    self.message = '已请求本局重发，按原出发位重设定位，保留首个普通物资和进攻进度'
                     self.record_reset_event('operator_resume_requested', reference)
                     return True
                 return

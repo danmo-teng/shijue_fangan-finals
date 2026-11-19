@@ -37,7 +37,7 @@ from capture_roi import (  # noqa: E402
 from rescue_vision.camera import LatestFrameCamera, resolve_camera_device  # noqa: E402
 from rescue_vision.vse import VseScaler  # noqa: E402
 from run_yolo_x5 import (  # noqa: E402
-    DEFAULT_LABELS,
+    display_class, DEFAULT_LABELS,
     DEFAULT_MODEL,
     DEFAULT_YOLO_SCORE_THRESHOLD,
     X5Yolo26,
@@ -265,7 +265,7 @@ def main() -> int:
             elif event == cv2.EVENT_RBUTTONDOWN:
                 values.clear()
                 drag_line = None
-            status = f"{edit_band}: {sorted(values)}; S:save bands (ROI unchanged)"
+            status = f"{display_class(edit_band)}: {sorted(values)}; S:save bands (ROI unchanged)"
             return
         if event == cv2.EVENT_LBUTTONDOWN:
             points.append((image_x, image_y))
@@ -390,7 +390,7 @@ def main() -> int:
                 cv2.circle(shown, center, 4, color, -1)
                 cv2.putText(
                     shown,
-                    f"{item.class_name} {item.confidence:.2f} {capture_side or '-'}",
+                    f"{display_class(item.class_name)} {item.confidence:.2f} {capture_side or '-'}",
                     (p0[0], max(18, p0[1] - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
@@ -501,8 +501,8 @@ def main() -> int:
             count = trail.samples if trail is not None else 0
             draw.text((8, 40), f"{'记录中' if recording else '已暂停'} · 已留影 {count} 次 · 开始前移开物块和手；固定相机和爪子。",
                       font=font, fill=(255, 220, 120))
-            band_entries = (("roi", "P：编辑爪内ROI"), ("green_supply", "G：绿色分区"),
-                            ("injured_orange", "O：橙色分区"), ("save_bands", "保存绿橙分区"))
+            band_entries = (("roi", "P：编辑爪内ROI"), ("green_supply", "G：普通物资分区"),
+                            ("injured_orange", "O：伤员分区"), ("save_bands", "保存普通物资和伤员分区"))
             for column, (action, label) in enumerate(band_entries):
                 x0, y0, x1, y1 = column*button_width+3, 75, (column+1)*button_width-3, 108
                 active = action == edit_band or (action == "roi" and edit_band is None)
@@ -510,9 +510,9 @@ def main() -> int:
                 draw.text((x0+8, y0+3), label, font=font, fill="white")
                 buttons.append((x0, y0+DISPLAY_HEIGHT, x1, y1+DISPLAY_HEIGHT, action))
             hint = ("分区：点两次画线，拖动调整；S保存，P回ROI；相机固定140°。" if edit_band else
-                    "按G画绿色分区，按O画橙色分区；分区单独保存，不改爪内ROI。")
+                    "按G画普通物资分区，按O画伤员分区；分区单独保存，不改爪内ROI。")
             if sweep_mode is not None:
-                hint = f"当前{int(sweep_mode)//100}°扫障区域：蓝色看框中心，其他看底边中点；仍排除载荷和区内物块。"
+                hint = f"当前{int(sweep_mode)//100}°扫障区域：危险物看框中心，其他看底边中点；仍排除载荷和区内物块。"
                 if any('\u4e00' <= c <= '\u9fff' for c in status):
                     hint = status
             draw.text((8, 116), hint, font=font, fill=(255, 220, 120))

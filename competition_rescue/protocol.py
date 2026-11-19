@@ -69,6 +69,7 @@ CMD_APPROACH_RANGE = 1 << 6
 APPROACH_RANGE_REOBSERVE = 1
 APPROACH_RANGE_PRE_GRAB = 2  # Paired firmware: open claw, 140deg, finite 50mm.
 APPROACH_RANGE_ZONE_VIEW = 3
+APPROACH_PRE_GRAB_RELOOK = 5  # Empty open claw: resume local search at 120 degrees.
 APPROACH_ORANGE_TOP_VIEW = 4  # Stop alignment, camera120->105, resume alignment; no travel.
 RELEASE_SAME_SIDE_BLUE = 1  # RELEASE_BOTH aux: original300mm escape +90deg, then SEARCH.
 CMD_STAGE_ONLY = 1 << 6
@@ -239,8 +240,10 @@ def mission_frame(
         zone_view = (aux_cdeg == APPROACH_RANGE_ZONE_VIEW and arg_a == 0 and arg_b == 10500
                      and not flags & CMD_CLUSTER_TARGET)
         orange_view = aux_cdeg == APPROACH_ORANGE_TOP_VIEW and arg_a == 0 and arg_b == 10500
+        relook = (aux_cdeg == APPROACH_PRE_GRAB_RELOOK and arg_a == 0 and arg_b == 12000 and
+                  not flags & CMD_CLUSTER_TARGET)
         if (flags & ~allowed or flags & (CMD_VALID | CMD_DISTANCE_VALID) != (CMD_VALID | CMD_DISTANCE_VALID) or
-                not (ordinary or pre_grab or zone_view or orange_view)):
+                not (ordinary or pre_grab or zone_view or orange_view or relook)):
             raise ValueError("invalid fixed-pitch approach range request")
     if flags & CMD_STAGE_ONLY and command not in {
         CMD_APPROACH_TARGET,

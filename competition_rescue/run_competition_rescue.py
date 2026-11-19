@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 
 from vision_replay import VisionReplay
-from search_zone_view import clipped
+from search_zone_view import clipped, clearly_outside
 from safe_zone_memory import SafeZoneCargoMemory
 from sweep_boundaries import runtime_boundaries, corridor_polygon
 from async_diagnostics import AsyncDiagnosticWriter
@@ -77,7 +77,7 @@ from protocol import (  # noqa: E402
     CMD_PAUSE,
     CMD_APPROACH_TARGET,
     CMD_APPROACH_RANGE,
-    APPROACH_ORANGE_TOP_VIEW,
+    APPROACH_ORANGE_TOP_VIEW, APPROACH_PRE_GRAB_RELOOK,
     CMD_CARGO_AUDIT,
     CMD_DISPERSE_PILE,
     CMD_RELEASE_LEFT,
@@ -113,6 +113,8 @@ from state_machine import (  # noqa: E402
     StmSnapshot,
     TrackedCargo,
     VisionSnapshot,
+    STM_MODE_POST_GRAB_AUDIT,
+    STM_MODE_SAFE_SWEEP_DONE,
     STM_MODE_TRANSPORT_AUDIT,
     STM_MODE_RECOVERY_WAIT,
     STM_MODE_NAVIGATE,
@@ -191,7 +193,7 @@ def arguments() -> argparse.Namespace:
         default=os.environ.get("RDK_ENABLE_DELIVERY_EARLY_EXIT") == "1",
         help="推进中确认本次载荷入区即放下退出；须先核对并部署配套F405，默认关闭")
     parser.add_argument("--enable-pre-grab-advance", action="store_true",
-        help="启用已标定的绿橙抓前50mm补进；须先部署配套F405 aux=2，默认关闭")
+        help="启用已标定的普通物资和伤员抓前50mm补进；须先部署配套F405 aux=2，默认关闭")
     parser.add_argument("--grip-bands", type=Path, default=VISION_ROOT / "config/capture_grip_bands.json")
     parser.add_argument("--enable-top-edge-range-reobserve", action="store_true",
         help="顶端截断目标分段接近后原角度重测；须配套F405 RANGE aux=1，默认关闭")
@@ -507,6 +509,8 @@ def audit_from_cargo(
     )
     isolated_track_ids = isolated_track_ids or set()
     return CargoAudit(
+        observed_track_ids=tuple(item.track_id for item in visible),
+        visible_green_in_claw=any(item.visible and item.class_name == "green_supply" for item in items),
         class_counts=tuple(sorted(Counter(item.class_name for item in visible).items())),
         left_class_counts=tuple(sorted(Counter(item.class_name for item in left).items())),
         right_class_counts=tuple(sorted(Counter(item.class_name for item in right).items())),
@@ -907,27 +911,29 @@ def capture_image_quality(image, pixel_format: str, rois: CaptureRois,
 
 
 class HeldCargoEvidence:
-    """Positive 140-degree load evidence, scoped to physical claw holding.
+    """Retain incompatible classes across missed frames within one stationary claw review."""
 
-    This is not a detector track or a fresh observation. It only prevents an
-    already seen casualty/material mixture becoming legal on missed frames.
-    Opening, releasing or separating the load clears the evidence.
-    """
-
-    HOLD_MODES = frozenset({10, 11, 22, 23, 40, 48, 51})
+    REVIEW_MODES = frozenset({STM_MODE_POST_GRAB_AUDIT, STM_MODE_SAFE_SWEEP_DONE,
+                              STM_MODE_TRANSPORT_AUDIT, STM_MODE_RECOVERY_WAIT})
 
     def __init__(self):
         self.items: dict[str, tuple[TrackedCargo, int]] = {}
+        self.review = None
         self.view_140_confirmed = False
 
     def clear(self):
         self.items.clear()
+        self.review = None
         self.view_140_confirmed = False
 
-    def observe(self, cargo, stm, rois, frame_sequence, image_quality_reason, partial_orange_ids=()):
-        if not stm.gripper_closed or stm.mode not in self.HOLD_MODES:
+    def observe(self, cargo, stm, rois, frame_sequence, image_quality_reason, partial_orange_ids=(), *, audit_epoch=0):
+        if not stm.gripper_closed or stm.mode not in self.REVIEW_MODES:
             self.clear()
             return
+        review = (stm.task_id, stm.mode, audit_epoch)
+        if review != self.review:
+            self.clear()
+            self.review = review
         if stm.camera_pitch_cdeg != 14000:
             self.view_140_confirmed = False
             return
@@ -1043,14 +1049,24 @@ def make_vision_snapshot(
     for item in own_zone_cargo:
         covers = [(name, box) for name, box in zone_boxes
                   if bbox_inside_safe_zone(item.bbox, box, item.class_name)]
-        if covers and not item.inside_safe_zone:
-            item = replace(item, inside_safe_zone=True)
+        if covers:
+            item = replace(item, inside_safe_zone=True, safe_zone_name=covers[0][0] if len(covers) == 1 else None)
+        elif item.inside_safe_zone:
+            item = replace(item, safe_zone_name="safe_" + mission.settings.side)
         if len(covers) == 1 and clipped(covers[0][1]):
             clipped_candidates.append((item.track_id, covers[0][0]))
         cargo_items.append(item)
     cargo = tuple(cargo_items)
     if safe_zone_memory is not None:
-        cargo = safe_zone_memory.apply(cargo, stm.camera_pitch_cdeg)
+        reviewed_id = None
+        view = mission.zone_observation
+        if (view is not None and view.completed_frame is not None and stm.camera_pitch_cdeg == 10500 and
+                frame_sequence > view.completed_frame and observed_s is not None and observed_s > view.completed_s):
+            if any(item.visible and item.track_id == view.target.track_id and
+                   item.class_name == view.target.class_name and clearly_outside(item, zone_boxes, view.zone)
+                   for item in cargo):
+                reviewed_id = view.target.track_id
+        cargo = safe_zone_memory.apply(cargo, stm.camera_pitch_cdeg, reviewed_outside_id=reviewed_id)
     rois = capture_rois or load_capture_rois(
         VISION_ROOT / "config/capture_roi.json"
     )
@@ -1122,7 +1138,7 @@ def make_vision_snapshot(
     remembered_capture = ()
     if held_cargo_evidence is not None:
         held_cargo_evidence.observe(claw_cargo, stm, rois,
-                                   frame_sequence, image_quality_reason, partial_orange_ids)
+                                   frame_sequence, image_quality_reason, partial_orange_ids, audit_epoch=mission.audit_epoch)
         if capture_enabled and capture_observation_valid:
             remembered_capture = held_cargo_evidence.missing_incompatible(capture)
             for item, source_frame in remembered_capture:
@@ -1236,7 +1252,8 @@ def make_vision_snapshot(
     expected_manifest = mission.carried_manifest
     if (capture_enabled and capture_observation_valid and audit is not None and
             mission._audit_valid(audit) and
-            (not expected_manifest or
+            (not expected_manifest or (stm.gripper_closed and stm.mode in {
+                STM_MODE_POST_GRAB_AUDIT, STM_MODE_TRANSPORT_AUDIT}) or
              Counter(item.class_name for item in capture) == Counter(expected_manifest))):
         known_carried_ids = {item.track_id for item in capture}
     known_carried_ids = carried_ids_after_pitch_change(
@@ -1248,7 +1265,8 @@ def make_vision_snapshot(
             safe_bbox is not None and not safe_zone_filter_blocked)
     exact_delivery_items = [
         item for item in own_zone_cargo
-        if item.visible and item.track_id in known_carried_ids
+        if item.visible and item.track_id in known_carried_ids and
+        (not expected_manifest or item.class_name in expected_manifest)
     ]
     # Do not turn an arbitrary, nearer same-class floor object into the load
     # when its original tracker disappears.
@@ -2111,6 +2129,8 @@ class CompetitionPlanner:
         if trace_exit:
             publish_start_ns = time.monotonic_ns()
         write_command_frame(self.command_path, packet)
+        if command.opcode == CMD_APPROACH_TARGET and command.flags & CMD_APPROACH_RANGE and command.arg_a > 0:
+            self.mission.pickup_distance_published = True
         if trace_exit:
             published_ns = time.monotonic_ns()
             try:
@@ -2202,6 +2222,9 @@ class CompetitionPlanner:
         if self.mission._original_recovery_lost(stm):
             return True
         state = self.mission.state
+        if (state == CompetitionState.INVALID_RELEASE and self.mission.invalid_release_context == "safe_zone_target"
+                and stm.mode in {24, 3}):
+            return False  # The release state itself consumes its matching DONE, not a generic recovery.
         if stm.mode in {24, 3} and self.mission.committed_audit_handoff_mode is not None:
             return True
         if stm.mode == 41:
@@ -2474,12 +2497,15 @@ class CompetitionPlanner:
                        pending.command.opcode == CMD_APPROACH_TARGET and
                        pending.command.flags & CMD_APPROACH_RANGE and
                        pending.command.aux == APPROACH_ORANGE_TOP_VIEW)
+        relook = (pending is not None and pending.command is not None and
+                  pending.command.aux == APPROACH_PRE_GRAB_RELOOK and
+                  self.mission.state == CompetitionState.PRE_GRAB_ADVANCE)
+        allowed_modes = {3, 21, 37, 38} if relook else {3, 20, 52} if orange_view else {3}
         if not (pending is not None and pending.command is not None and
                 pending.command.opcode == CMD_APPROACH_TARGET and
-                self.mission.state in {CompetitionState.INITIAL_APPROACH,
-                    CompetitionState.APPROACH, CompetitionState.CLUSTER_APPROACH} and
-                stm.fresh and stm.context_valid and
-                stm.mode in ({3, 20, 52} if orange_view else {3}) and
+                (relook or self.mission.state in {CompetitionState.INITIAL_APPROACH,
+                    CompetitionState.APPROACH, CompetitionState.CLUSTER_APPROACH}) and
+                stm.fresh and stm.context_valid and stm.mode in allowed_modes and
                 stm.task_id == self.protocol_task and stm.action_status & 4 and
                 stm.rejected_action_id == self.protocol_action):
             return None
@@ -2488,6 +2514,15 @@ class CompetitionPlanner:
             return None  # A late duplicate rejection cannot cancel an accepted action.
         self._adopt_recovery_context()
         current = replace(stm, context_matches=True)
+        if relook:
+            self.mission.pre_grab_command = None
+            if stm.mode == 3:
+                return self.mission._audit_reacquire_output(vision, current, now)
+            self.mission.pre_grab_relook_rejected = True
+            self.mission._begin_capture_audit(vision, now, cluster_active=stm.mode in {37, 38},
+                recheck_pending=False, recheck_context="none")
+            return replace(self.mission._audit_output(vision, current, now),
+                event="pre_grab_relook_rejected", message="重选未被接受，按当前爪内画面恢复审核")
         if orange_view:
             self.mission.orange_top_view_command = None
             self.mission.orange_top_view_frame_floor = None
@@ -2646,6 +2681,10 @@ class CompetitionPlanner:
             return handoff
         # Recovery is an observation from the MCU, not an ACK of the last
         # requested action. Handle it before context_pending/camera pause.
+        if (self.mission.state == CompetitionState.INVALID_RELEASE and self.mission.invalid_release_context == "safe_zone_target"
+                and stm.mode in {24, 3} and not paused and not stm.fault):
+            matches = (stm.context_valid and stm.task_id == self.protocol_task and stm.action_id == self.protocol_action)
+            return self.mission.step(vision, pose, replace(stm, context_matches=matches), now)
         if self._is_recovery_observation(stm):
             self._adopt_recovery_context()
             result = self.mission.step(vision, pose, replace(stm, context_matches=True), now)
@@ -2741,6 +2780,15 @@ class CompetitionPlanner:
             # forever after the actual image has recovered. Higher-view
             # reacquisition belongs to that same dynamic visual action.
             return self.mission.step(vision, pose, replace(stm, context_matches=matches), now)
+        if (self.mission.state == CompetitionState.SEARCH and stm.mode == STM_MODE_SEARCH and
+                stm.fresh and stm.context_valid and stm.action_status & 1 and not stm.gripper_closed and
+                not matches and self.protocol_last_output is not None and
+                (self.protocol_last_output.command is None or
+                 self.protocol_last_output.command.opcode in {CMD_HOLD, CMD_PAUSE})):
+            # Both ends are searching with no pending mechanical request. Follow the actual owner
+            # so an old HOLD cannot bypass target selection and station-angle accounting forever.
+            self._adopt_recovery_context()
+            return self.mission.step(vision, pose, replace(stm, context_matches=True), now)
         if (self.protocol_last_output is not None and stm.fresh and
                 not matches and stm.mode != 41 and not stm.fault):
             pending = self.protocol_last_output.command
@@ -3033,7 +3081,6 @@ class CompetitionPlanner:
             "initial_claw_check_started": self.mission.initial_claw_check_started,
             "initial_claw_check_execution_seen": self.mission.initial_claw_check_execution_seen,
             "first_common_delivered": self.mission.first_common_delivered,
-            "first_green_bump_used": self.mission.first_green_bump_used,
             "first_fault_code": self.mission.first_fault_code,
             "delivery_count": self.mission.delivery_count,
             "disperse_attempts": self.mission.disperse_attempts,
@@ -3043,7 +3090,6 @@ class CompetitionPlanner:
             "disperse_expected_done_mode": self.mission.disperse_expected_done_mode,
             "disperse_relay_tx_baseline": self.mission.disperse_relay_tx_baseline,
             "disperse_context": self.mission.disperse_context,
-            "disperse_observe_attempts": self.mission.disperse_observe_attempts,
             "disperse_command_accepted": self.mission.disperse_command_accepted,
             "cluster_id": self.mission.cluster_id,
             "cluster_signature": self.mission.cluster_signature,

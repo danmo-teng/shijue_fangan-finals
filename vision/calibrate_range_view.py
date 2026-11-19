@@ -78,7 +78,7 @@ def main() -> int:
     if not 2 <= args.bands <= 12:
         parser.error("--bands须为2..12")
     import cv2
-    from run_yolo_x5 import load_labels, DEFAULT_LABELS, DEFAULT_YOLO_SCORE_THRESHOLD
+    from run_yolo_x5 import display_class, load_labels, DEFAULT_LABELS, DEFAULT_YOLO_SCORE_THRESHOLD
     from rescue_vision.camera import LatestFrameCamera, resolve_camera_device
     from rescue_vision.vision_protocol import IMAGE_WIDTH, IMAGE_HEIGHT
 
@@ -157,7 +157,7 @@ def main() -> int:
                 band = next((b["band"] for b in bands if b["y_min"] <= cy < b["y_max"]), None)
                 cv2.rectangle(shown, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.drawMarker(shown, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 22, 2)
-                label = f'{detection.class_name} ({cx},{cy}) B{band} {detection.confidence:.2f}'
+                label = f'{display_class(detection.class_name)} ({cx},{cy}) B{band} {detection.confidence:.2f}'
                 cv2.putText(shown, label, (max(0, x), max(90, y - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, .58, (0, 255, 255), 2)
                 records.append({"class": detection.class_name, "bbox": detection.bbox,

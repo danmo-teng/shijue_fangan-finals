@@ -595,7 +595,7 @@ def test_claw_isolated_singleton_uses_existing_geometry_without_new_wire_fields(
         audit = view.capture_audit
         assert view.capture_observation_valid and audit.left_count == 3 and audit.right_count == 1
         assert audit.right_isolated_green == (expected == "right")
-        assert mission._preferred_keep_side(audit) == "left"  # Three greens versus one.
+        assert mission._preferred_keep_side(audit) == "right"  # The right claw has exactly one ordinary item.
         without_image_hint = replace(audit, left_isolated_green=False, right_isolated_green=False)
         assert mission._audit_payload(audit) == mission._audit_payload(without_image_hint)
     # A large adjacent detection must not be declared independent from its centre distance alone.
@@ -946,7 +946,6 @@ def test_detection_logging() -> None:
     mixed = runner_module.audit_from_cargo((items[0], items[3]), side_by_track={1:"left",4:"left"})
     assert mixed.left_class == "unknown" and mixed.injury_mixed and not mixed.unknown_present
     assert mission._side_is_disperse_candidate(mixed, "left") and not mission._audit_valid(mixed)
-    assert not mission._should_first_green_bump(mixed)
     planner = CompetitionPlanner.__new__(CompetitionPlanner)
     planner.mission = mission
     planner.protocol_task, planner.protocol_action = 1, 2
@@ -2607,13 +2606,17 @@ def test_held_mixture_survives_detector_gap_and_clears_on_physical_separation():
     observe((orange, green), 3083, mode=10, flags=2)
     m.state = CompetitionState.TRANSPORT_AUDIT
     observe((orange,), 3119, flags=2)
+    at_gate = observe((orange,), 3120)
+    assert at_gate.capture_audit.total_count == 1
+    assert not any("remembered_source_frame" in d for d in at_gate.roi_decisions)
+    observe((orange, green), 3122)  # Both are actually visible at this gate review.
     for frame in (3123, 3126):
         actual = observe((orange,), frame)
         assert actual.capture_audit.total_count == 2 and actual.capture_audit.injury_mixed
         assert not m._audit_valid(actual.capture_audit)
         assert actual.capture_cargo == (orange,)  # Not a fabricated detector box.
         remembered = [d for d in actual.roi_decisions if "remembered_source_frame" in d]
-        assert remembered[0]["remembered_source_frame"] == 3083
+        assert remembered[0]["remembered_source_frame"] == 3122
     assert observe((), 3127).capture_audit.total_count == 0
     observe((orange,), 3128, mode=25, flags=2)  # Actual separation clears old load evidence.
     clean = observe((orange,), 3130)
@@ -4044,7 +4047,7 @@ def test_first_green_drops_blue_side_even_with_more_greens_and_overlapping_boxes
     clean=replace(a,left_count=1,left_green_count=1,left_class_counts=(('green_supply',1),),
         right_count=2,right_green_count=2,right_class='green_supply',right_class_counts=(('green_supply',2),),
         right_invalid=False,danger_present=False,total_count=3)
-    assert m._preferred_keep_side(clean)=='right'
+    assert m._preferred_keep_side(clean)=='left'
 
 
 def test_delivery_exit_is_published_and_timed_once(tmp_path):
@@ -4187,3 +4190,64 @@ def test_repush_wheel_policy_restores_on_reverse_and_relatches_at_contact():
         policy.update(out,replace(st,mode=mode),7,12,depth_m=depth)
         assert policy.suppressed == disabled
     policy.close()
+
+
+def test_old_search_receipt_cannot_finish_release_or_block_station_transfer(tmp_path):
+    from dataclasses import replace
+    from protocol import CMD_APPROACH_TARGET, CMD_RELEASE_BOTH, CMD_HOLD
+    from state_machine import CommandRequest, CompetitionOutput
+    m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+    m.first_common_delivered = m.initial_stash_done = True
+    planner = CompetitionPlanner(m,tmp_path/'pose',tmp_path/'stm',tmp_path/'cmd',tmp_path/'diag',
+                                 JsonlLog(tmp_path/'events'),50)
+    p = PoseSnapshot(True,-.4,0.,22.,0)
+    v = VisionSnapshot(frame_sequence=8263,range_pitch_cdeg=12000)
+    old = StmSnapshot(mode=3,age_ms=0,camera_pitch_cdeg=12000,context_valid=True,task_id=32519,
+                      action_id=58402,accepted_command=CMD_APPROACH_TARGET,action_status=3)
+    planner.protocol_task = planner.protocol_task_cursor = 32520
+    planner.protocol_action = planner.protocol_action_cursor = 58404
+    pending = CommandRequest(CMD_RELEASE_BOTH,m._side_flags())
+    m._set_state(CompetitionState.INVALID_RELEASE,1.)
+    m.invalid_release_context, m.invalid_release_side, m.invalid_release_final = "safe_zone_target", "both", True
+    planner.protocol_last_output = CompetitionOutput(m.state,pending,"")
+    assert planner._output_for_cycle(v,p,old,False,1.1).command == pending
+    assert m.state == CompetitionState.INVALID_RELEASE
+    owner = replace(old,mode=24,task_id=32520,action_id=58404,accepted_command=CMD_RELEASE_BOTH,action_status=1)
+    assert planner._output_for_cycle(v,p,owner,False,1.2).command.opcode == CMD_HOLD
+    done = replace(owner,mode=3,action_status=3)
+    assert planner._output_for_cycle(v,p,done,False,1.3).state == CompetitionState.SEARCH
+
+    # The observed field failure: both ends already searching, upper bookkeeping still on 58402.
+    planner.protocol_task,planner.protocol_action = old.task_id,old.action_id
+    planner.protocol_last_output = CompetitionOutput(m.state,m._hold(),"")
+    m.search_site_turn_deg = m.search_yaw_accum_deg = 539.
+    m.search_last_yaw_deg = 20.
+    out=planner._output_for_cycle(replace(v,frame_sequence=8264),p,done,False,1.4)
+    assert (planner.protocol_task,planner.protocol_action)==(done.task_id,done.action_id)
+    assert out.state == CompetitionState.SEARCH_TRANSFER and m.search_transfer_route.target_point==3
+
+
+def test_empty_claw_relook_rejection_resumes_actual_audit(tmp_path):
+    from dataclasses import replace
+    from protocol import APPROACH_PRE_GRAB_RELOOK, CMD_CARGO_AUDIT
+    from state_machine import CargoAudit, CargoBatch, TrackedCargo
+    m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False, pre_grab_advance_enabled=True))
+    m.first_common_delivered = True
+    m._select_batch(CargoBatch((1,), ("core_black",), "material"))
+    m.state = CompetitionState.CAPTURE_AUDIT
+    planner = CompetitionPlanner(m, tmp_path/"pose", tmp_path/"stm", tmp_path/"cmd",
+                                 tmp_path/"diag", JsonlLog(tmp_path/"events"), 50)
+    view = VisionSnapshot(frame_sequence=8, observed_monotonic_s=1.,
+        cargo=(TrackedCargo(3, "green_supply", .95, (800, 400, 70, 80), hits=4),), capture_audit=CargoAudit())
+    board = StmSnapshot(mode=21, flags=1, age_ms=1., camera_pitch_cdeg=14000)
+    request = m._pre_grab_depth_output(view, board, 1.)
+    assert request.command.aux == APPROACH_PRE_GRAB_RELOOK
+    planner._publish(request)
+    rejected = replace(board, context_valid=True, task_id=planner.protocol_task,
+        rejected_action_id=planner.protocol_action, action_status=4)
+    assert planner._reconcile_approach_rejection(view, PoseSnapshot(), replace(
+        rejected, rejected_action_id=(planner.protocol_action+1)&65535), 1.1) is None
+    out = planner._output_for_cycle(view, PoseSnapshot(valid=True), rejected, False, 1.1)
+    assert out.event == "pre_grab_relook_rejected"
+    after = m._audit_output(replace(view, frame_sequence=9, observed_monotonic_s=1.22), board, 1.22)
+    assert after.command.opcode == CMD_CARGO_AUDIT and m.pre_grab_command is None
