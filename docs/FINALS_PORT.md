@@ -1,8 +1,8 @@
 # 决赛基线
 
-决赛 main 已配对 `Final_Run/Final_task@4656c77`。首件正式投送为单普通，确认进区并完成本次退出后登记；首件后纯普通、核心 1～3 件整批直送，伤员单件。分离复用左右夹爪及真实整爪复审，每批最多三次。沿用送达确认与未确认超时退出。32 项相关离线检查通过，板端实际版本及实车效果待验。[本轮实现和接口边界](FINALS_QUESTIONNAIRE_SEPARATION_20261119.md)
+决赛上位比赛流程同步到初赛 `c1425ef`。首件后按距离选择目标，沿用初赛的夹内审核、选侧、分离次数、搜索换点、门口侧挤、三件重推和送达记账。正式入口默认保存录像和日志，按初赛的赛间 10 GB 余量策略管理定位会话。
 
-上位已停用橙黑分离 `U=8200`、门口横移滤除和首件撞堆。下位 `FinalRun` 预设关闭抓后自动抬爪滤除。决赛现场需使用匹配固件。
+决赛按普通左右夹爪动作处理混装，禁用抓后自动抬爪滤除、橙黑直退滤除、门口横移滤除及分离抬爪 `U=8200`。普通保橙夹紧调整和张爪放货后的三件重推属于初赛流程。决赛下位配套按 `Final_task@4656c77` 制作，已通过隔离构建，等待对端合入和烧录。[下位配套与接口](CROSS_REPO_REQUESTS.md)
 
 决赛上位机位于 `/home/sunrise/RDK_X5/finals`。比赛流程和定位基线来自初赛 `302427138e426536673738d83cdf57ac6cd7242f`。当前模型使用 `yolo26n/x5_output_640_1119_final/yolo26n_6cls_640_1119_final_bpu_bayese_640x640_nv12.bin`，SHA-256 为 `e1cd7f3b54e14bbe48e3ab3119d64a34047fda2984024d26e2be475b10aeb12a`。六类顺序沿用正式类别表，置信阈值为 0.20，NMS 为 0.45。
 
@@ -10,7 +10,7 @@
 
 决赛程序使用本仓库内的 ROI、抓前分区、扫障边界及 105°/120° 测距表。两份测距绘图布局位于 `vision/captures/range_calibration/layouts/`，正式的距离参数位于 `vision/config/approach_range.json`。决赛运行文件使用本仓库 `rescue_map/runtime/` 和决赛专用 `/dev/shm/rdk-rescue-finals-*`，操作 socket 使用 `@rescue-finals-operator-<UID>`。历史运行记录和录制数据按各自项目继续保存。
 
-RDK 已部署与基线匹配的定位程序及两个原生库，见 `localization/build/formal-contact-wheel/provenance.json`。本机依赖包括 `vision/native/` 下的 JPU/VSE 动态库、`build-250/librealsense/` 下的 RealSense 2.50 与固件，以及 `t265_trajectory/build/t265_boot`。这些设备构建产物单独部署。决赛源码与人工作业标定由本地独立 Git 仓库跟踪。
+RDK 已部署与初赛正式入口一致的 `formal-unload-guard` 定位程序及两个原生库，见 `localization/build/formal-unload-guard/provenance.json`。本机依赖包括 `vision/native/` 下的 JPU/VSE 动态库、`build-250/librealsense/` 下的 RealSense 2.50 与固件，以及 `t265_trajectory/build/t265_boot`。这些设备构建产物单独部署。决赛源码与人工作业标定由本地独立 Git 仓库跟踪。
 
 模型权重在 RDK 单独部署。新克隆需另行将决赛权重放到上文的模型路径。仓库保存类别表、测距和其他标定配置。
 

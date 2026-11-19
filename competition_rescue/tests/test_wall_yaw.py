@@ -55,7 +55,8 @@ def test_native_yaw_pivot_and_round_ownership():
                 receive_monotonic_ns=t,x_m=x,y_m=y,yaw_rad=math.radians(45),tracker_confidence=3))
         sample(1,1.,1.)
         e.align('start',center_xy=(1.,1.),heading_deg=45,round_token='r',wall_yaw_word=0x807b)
-        sample(2,1.3,.9)
+        # Keep this 5 ms fixture below the chassis-centre speed threshold.
+        sample(2,1.003,.999)
         before=rt.snapshot()['last']
         import pytest
         with pytest.raises(ValueError):rt.command('wall_yaw_commit',dict(round_token='old',delta_cdeg=400))
@@ -64,9 +65,9 @@ def test_native_yaw_pivot_and_round_ownership():
         assert np.allclose(after['center_xy_m'],before['center_xy_m'])
         assert abs(after['yaw_deg']-before['yaw_deg']-4)<1e-7
         with pytest.raises(ValueError):rt.command('wall_yaw_commit',dict(round_token='r',delta_cdeg=400))
-        sample(3,1.4,.9)
+        sample(3,1.004,.999)
         assert np.allclose(np.subtract(rt.snapshot()['last']['center_xy_m'],after['center_xy_m']),
-                           rotation(math.radians(4))@[.1,0])
+                           rotation(math.radians(4))@[.001,0])
     finally:rt.close()
 
 

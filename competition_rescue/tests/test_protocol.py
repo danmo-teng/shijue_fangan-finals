@@ -244,52 +244,33 @@ def test_station_only_turn_modes_have_strict_payload_and_preserve_legacy():
     import pytest
     from protocol import mission_frame,CMD_BULLDOZER_STEP,crc16_modbus
     for side in (0,8):
-        for mode in (1,2):
+        for mode in (1,2,3):
             for direction in (-1,1):
                 frame=mission_frame(7,CMD_BULLDOZER_STEP,0xe1|side,mode,direction,18000)
                 assert len(frame)==15 and int.from_bytes(frame[12:14],'little')==crc16_modbus(frame[2:12])
         assert mission_frame(0,CMD_BULLDOZER_STEP,0xe1|side,0,0,9000)
-        for mode,direction in [(0,1),(1,0),(2,2),(3,1),(-1,-1)]:
+        for mode,direction in [(0,1),(1,0),(2,2),(3,2),(4,1),(-1,-1)]:
             with pytest.raises(ValueError):mission_frame(0,CMD_BULLDOZER_STEP,0xe1|side,mode,direction,0)
         with pytest.raises(ValueError):mission_frame(0,CMD_BULLDOZER_STEP,0x01|side,1,1,0)
 
 
-def test_orange_core_82_separation_payload_is_strict_and_keeps_legacy_zero():
+def test_finals_lift_filter_commands_are_disabled():
     import pytest
-    from protocol import (mission_frame,CMD_DISPERSE_PILE,CMD_RELEASE_LEFT,CMD_RELEASE_RIGHT,
-        CMD_SIDE_VALID,CMD_TARGET_RIGHT,CMD_VALID,CMD_RED_SIDE,SEPARATION_ORANGE_CORE_82,crc16_modbus)
-    for red in (0,CMD_RED_SIDE):
-        for command,flags in [(CMD_DISPERSE_PILE,CMD_VALID|red|CMD_SIDE_VALID),
-                              (CMD_DISPERSE_PILE,CMD_VALID|red|CMD_SIDE_VALID|CMD_TARGET_RIGHT),
-                              (CMD_RELEASE_LEFT,CMD_VALID|red),(CMD_RELEASE_RIGHT,CMD_VALID|red)]:
-            for angle in (0,SEPARATION_ORANGE_CORE_82):
-                f=mission_frame(1,command,flags,0,0,angle)
-                assert int.from_bytes(f[12:14],'little')==crc16_modbus(f[2:12])
-            for a,b,angle in [(1,0,8200),(0,1,8200),(0,0,8800)]:
-                with pytest.raises(ValueError):mission_frame(1,command,flags,a,b,angle)
-    with pytest.raises(ValueError):mission_frame(1,CMD_DISPERSE_PILE,CMD_VALID,0,0,8200)
-    from protocol import CMD_RELEASE_BOTH
-    with pytest.raises(ValueError):mission_frame(1,CMD_RELEASE_BOTH,CMD_VALID,0,0,8200)
+    from protocol import (
+        CMD_DISPERSE_PILE, CMD_KEEP_ORANGE, CMD_ORANGE_CORE_FILTER, CMD_ORANGE_GATE_FILTER,
+        CMD_RELEASE_BOTH, CMD_RELEASE_LEFT, CMD_RELEASE_RIGHT, CMD_SIDE_VALID,
+    )
 
-
-def test_orange_gate_filter_packet_contract():
-    from protocol import CMD_ORANGE_GATE_FILTER, CMD_RED_SIDE, CMD_SIDE_VALID, CMD_TARGET_RIGHT
-    for red in (False, True):
-        for right in (False, True):
-            flags = CMD_VALID | CMD_SIDE_VALID | (CMD_RED_SIDE if red else 0) | (CMD_TARGET_RIGHT if right else 0)
-            heading = 9000 if red else 27000
-            packet = mission_frame(12, CMD_ORANGE_GATE_FILTER, flags, 100, 8600, heading)
-            assert packet[2] == 0x18 and packet[4] == 0x16 and len(packet) == 15
-            assert int.from_bytes(packet[6:8], 'big', signed=True) == 100
-            assert int.from_bytes(packet[8:10], 'big', signed=True) == 8600
-            assert int.from_bytes(packet[10:12], 'big') == heading
-            assert int.from_bytes(packet[12:14], 'little') == crc16_modbus(packet[2:12])
-            for bad in [(flags & ~CMD_SIDE_VALID,100,8600,heading), (flags,150,8600,heading),
-                        (flags,100,8800,heading), (flags,100,8200,heading), (flags,100,8600,(heading+18000)%36000),
-                        (flags | 0x20,100,8600,heading)]:
-                try:
-                    mission_frame(12, CMD_ORANGE_GATE_FILTER, *bad)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError(bad)
+    for command in (CMD_DISPERSE_PILE, CMD_RELEASE_LEFT, CMD_RELEASE_RIGHT, CMD_RELEASE_BOTH):
+        flags = CMD_VALID
+        if command == CMD_DISPERSE_PILE:
+            flags |= CMD_SIDE_VALID | CMD_KEEP_ORANGE
+        mission_frame(1, command, flags, 0, 0, 0)
+        with pytest.raises(ValueError):
+            mission_frame(1, command, flags, 0, 0, 8200)
+    for command, flags, a, b, u in (
+        (CMD_ORANGE_GATE_FILTER, CMD_VALID | CMD_SIDE_VALID, 100, 8600, 27000),
+        (CMD_ORANGE_CORE_FILTER, CMD_VALID, -100, 8600, 8200),
+    ):
+        with pytest.raises(ValueError):
+            mission_frame(1, command, flags, a, b, u)

@@ -539,6 +539,34 @@ def test_planner_stop_records_unconfirmed_abort_timeout() -> None:
         assert planner.termination_result["timeout"] is True
 
 
+def test_closed_claw_recognizes_distinct_nested_orange_and_core_as_mixed():
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from capture_roi import CaptureRois, split_capture_roi
+    from state_machine import CargoBatch, TrackedCargo
+
+    polygon = ((180, 140), (1120, 140), (1120, 660), (180, 660))
+    rois = CaptureRois(polygon, *split_capture_roi(polygon))
+    mission = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+    mission.first_common_delivered = True
+    mission._select_batch(CargoBatch((584,), ("injured_orange",), "injury"))
+    orange = TrackedCargo(584, "injured_orange", .9, (450, 193, 441, 306), hits=6)
+    black = TrackedCargo(587, "core_black", .9, (493, 415, 131, 77), hits=6)
+    for mode in (23, 48):
+        status = StmSnapshot(mode=mode, flags=3, age_ms=0, camera_pitch_cdeg=14000)
+        for core, clear in ((black, True), (replace(black, bbox=orange.bbox), False)):
+            with patch.object(runner_module, "tracked_cargo", return_value=(orange, core)):
+                view = runner_module.make_vision_snapshot([], [], SimpleNamespace(calibrated=False),
+                    None, status, mission, 7672, capture_rois=rois, observed_s=1.)
+            assert view.capture_observation_valid == clear
+            if clear:
+                assert view.capture_audit.total_count == 2 and view.capture_audit.injury_mixed
+                assert not mission._audit_valid(view.capture_audit)
+            else:
+                assert view.capture_audit is None
+
+
 def test_claw_isolated_singleton_uses_existing_geometry_without_new_wire_fields() -> None:
     from dataclasses import replace
     from types import SimpleNamespace
@@ -565,7 +593,7 @@ def test_claw_isolated_singleton_uses_existing_geometry_without_new_wire_fields(
         audit = view.capture_audit
         assert view.capture_observation_valid and audit.left_count == 3 and audit.right_count == 1
         assert audit.right_isolated_green == (expected == "right")
-        assert mission._preferred_keep_side(audit) == "right"  # Single green wins even when adjacent.
+        assert mission._preferred_keep_side(audit) == "left"  # Three greens versus one.
         without_image_hint = replace(audit, left_isolated_green=False, right_isolated_green=False)
         assert mission._audit_payload(audit) == mission._audit_payload(without_image_hint)
     # A large adjacent detection must not be declared independent from its centre distance alone.
@@ -2139,7 +2167,8 @@ def test_formal_button_launcher_wiring_without_hardware():
             command = app.localization_command(); vision = app.vision_command()
             assert command[command.index('--operator-socket')+1] == app.operator.socket_name
             assert '--no-display' in vision
-            assert vision[vision.index('--operator-control')+1] == str(runtime/'operator_control.json')
+            assert vision[vision.index('--operator-control')+1] == str(app.control_ipc_dir/'operator_control.json')
+            assert app.operator.socket_name.startswith('@rescue-finals-operator-')
             assert vision[vision.index('--reset-session-token')+1] == token
             assert app.vision_command()[app.vision_command().index('--reset-session-token')+1] == token
             app.reset_session(source='offline-check')
@@ -2549,7 +2578,7 @@ def test_two_material_delivery_confirmation_requires_both_known_items():
     assert view(known[:1]).delivery_target_inside_safe_zone
 
 
-def test_valid_cargo_audit_uses_current_detections_without_held_mixture_backfill():
+def test_held_mixture_survives_detector_gap_and_clears_on_physical_separation():
     from dataclasses import replace
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -2560,6 +2589,7 @@ def test_valid_cargo_audit_uses_current_detections_without_held_mixture_backfill
     m._select_batch(CargoBatch((204,), ("injured_orange",), "injury"))
     m.first_common_delivered = True
     m.state = CompetitionState.POST_GRAB_AUDIT
+    memory = runner_module.HeldCargoEvidence()
     rois = load_capture_rois(PROJECT_ROOT / "vision/config/capture_roi.json")
     orange = TrackedCargo(204, "injured_orange", .85, (528, 167, 402, 318), hits=398)
     green = TrackedCargo(224, "green_supply", .32, (306, 276, 264, 217), hits=91)
@@ -2568,7 +2598,7 @@ def test_valid_cargo_audit_uses_current_detections_without_held_mixture_backfill
         with patch.object(runner_module, "tracked_cargo", return_value=items):
             return runner_module.make_vision_snapshot([], [], SimpleNamespace(calibrated=False), None,
                 StmSnapshot(mode=mode, flags=flags, camera_pitch_cdeg=pitch, age_ms=0),
-                m, frame, capture_rois=rois)
+                m, frame, capture_rois=rois, held_cargo_evidence=memory)
 
     observe((orange,), 2900, mode=23)  # Existing camera-ready view; no new waiting.
     m.state = CompetitionState.NAVIGATE
@@ -2577,19 +2607,18 @@ def test_valid_cargo_audit_uses_current_detections_without_held_mixture_backfill
     observe((orange,), 3119, flags=2)
     for frame in (3123, 3126):
         actual = observe((orange,), frame)
-        assert actual.capture_audit.total_count == 1 and not actual.capture_audit.injury_mixed
-        assert m._audit_valid(actual.capture_audit)
-        assert actual.capture_cargo == (orange,)
-        assert not any("remembered_source_frame" in d for d in actual.roi_decisions)
+        assert actual.capture_audit.total_count == 2 and actual.capture_audit.injury_mixed
+        assert not m._audit_valid(actual.capture_audit)
+        assert actual.capture_cargo == (orange,)  # Not a fabricated detector box.
+        remembered = [d for d in actual.roi_decisions if "remembered_source_frame" in d]
+        assert remembered[0]["remembered_source_frame"] == 3083
     assert observe((), 3127).capture_audit.total_count == 0
-    mixed = observe((orange, green), 3128)
-    assert mixed.capture_audit.total_count == 2 and mixed.capture_audit.injury_mixed
-    assert not m._audit_valid(mixed.capture_audit)
-    observe((orange,), 3129, mode=25, flags=2)
+    observe((orange,), 3128, mode=25, flags=2)  # Actual separation clears old load evidence.
     clean = observe((orange,), 3130)
     assert clean.capture_audit.total_count == 1 and m._audit_valid(clean.capture_audit)
     observe((orange, green), 3131)
     observe((), 3132, flags=0)
+    assert not memory.items
     # An outside/truncated green cannot create incompatible load evidence.
     outside = replace(green, bbox=(0, 0, 70, 70))
     observe((orange, outside), 3133)
@@ -2888,6 +2917,16 @@ def test_closed_partial_orange_is_mixed_evidence_not_single_injury_permission():
     assert view((green,far),status).capture_audit.total_count==1
     assert view((orange,),status).capture_audit.total_count==0
     assert view((green,replace(orange,inside_safe_zone=True)),status).capture_audit.total_count==1
+    held=runner_module.HeldCargoEvidence()
+    held.observe((green,orange),status,roi,10,'',(orange.track_id,))
+    assert {x.class_name for x,_ in held.missing_incompatible((green,))}=={'injured_orange'}
+    held.observe((green,),replace(status,mode=25),roi,11,'')
+    assert held.missing_incompatible((green,))==()
+    blue=replace(orange,class_name='danger_cyan',bbox=(680,350,120,100))
+    held.observe((green,blue),status,roi,12,'')
+    assert {x.class_name for x,_ in held.missing_incompatible((green,))}=={'danger_cyan'}
+    held.observe((),replace(status,flags=1),roi,13,'')
+    assert held.missing_incompatible((green,))==()
 
 
 def test_locked_single_target_keeps_whole_claw_audit_in_every_view():
@@ -3175,6 +3214,9 @@ def test_only_green_capture_ignores_bottom_point_at_fortyfive_percent_overlap():
         assert snapshot(replace(green,class_name=name)).capture_audit.total_count == 0
     orange = replace(green,class_name="injured_orange",bbox=(150,220,100,100))
     assert snapshot(orange).capture_audit.total_count == 1  # Existing >=80%/centre exception.
+    held = runner_module.HeldCargoEvidence()
+    held.observe((green,),status,rois,10,"")
+    assert "green_supply" in held.items  # No obsolete foot rule in the closed-claw cache.
 
 
 def test_real_platform_core_is_incompatible_only_before_first_green_delivery():
@@ -3507,6 +3549,15 @@ def test_recorded_partial_green_guides_separation_without_inflating_cargo():
 
 
 def test_delivery_local_timeout_exit_wins_pending_completion_without_reusing_action_ids():
+    _check_local_delivery_exit(16, 'delivery_push_timeout')
+
+
+def test_delivery_repush_exit_is_counted_once_with_or_without_pending_complete():
+    from state_machine import STM_MODE_REPUSH_EXIT
+    _check_local_delivery_exit(STM_MODE_REPUSH_EXIT, 'delivery_repush_finished')
+
+
+def _check_local_delivery_exit(exit_mode, basis):
     from dataclasses import replace
     from protocol import CMD_ENTER_SAFE_ZONE, CMD_TASK_COMPLETE, CMD_RETURN_CENTER
     from state_machine import CargoBatch
@@ -3515,15 +3566,14 @@ def test_delivery_local_timeout_exit_wins_pending_completion_without_reusing_act
             root = Path(d)
             m = CompetitionMission(CompetitionSettings(side='red', initial_stash_enabled=False,
                                                        delivery_early_exit_enabled=True))
-            m._select_batch(CargoBatch((11,), ('green_supply',), 'material'))
-            m.carried_manifest = ('green_supply',)
-            m.confirmed_delivery_destination = 'material'
+            m._select_batch(CargoBatch((11,), ('injured_orange',), 'injury'))
+            m.carried_manifest = ('injured_orange',)
             m.state = CompetitionState.ENTER_SAFE_ZONE
             planner = CompetitionPlanner(m, root/'pose', root/'stm', root/'command',
                                          root/'diag', JsonlLog(root/'events'), 50)
             planner._publish(CompetitionOutput(m.state, m._enter_safe_zone_command(), 'fixture'))
             task, enter_action = planner.protocol_task, planner.protocol_action
-            status = StmSnapshot(mode=16, flags=0, age_ms=0, context_valid=True,
+            status = StmSnapshot(mode=exit_mode, flags=0, age_ms=0, context_valid=True,
                 task_id=task, action_id=enter_action, accepted_command=CMD_ENTER_SAFE_ZONE, action_status=3)
             if pending_complete:
                 out = m._finish_delivery(status, 1., basis='delivery_visual_early', message='fixture', event='')
@@ -3540,59 +3590,13 @@ def test_delivery_local_timeout_exit_wins_pending_completion_without_reusing_act
             assert paused.command.opcode == runner_module.CMD_PAUSE
             result = planner._output_for_cycle(VisionSnapshot(), PoseSnapshot(valid=True), status, False, 2.1)
             assert result.state == CompetitionState.RETURN_CENTER
-            assert result.event == 'delivery_push_timeout_exit'
-            assert m.delivery_completion_basis == 'delivery_push_timeout'
-            assert not m.first_common_delivered
-            assert m.delivery_count == m.orange_search_round == 0
+            assert result.event == basis + '_exit'
+            assert m.delivery_completion_basis == basis
+            assert m.delivery_count == 1
             planner._publish(result)
             assert result.command.opcode == CMD_RETURN_CENTER
             assert planner.protocol_action == (high_water + 1) & 65535
             assert planner._reconcile_delivery_local_exit(PoseSnapshot(valid=True), status, 2.2) is None
-
-
-def test_finals_pause_and_hot_stop_record_only_the_matching_confirmed_exit():
-    from dataclasses import replace
-    from unittest.mock import patch
-    from protocol import CMD_TASK_COMPLETE
-    from round_resume import match_progress, restore_progress
-    from state_machine import CargoAudit, CargoBatch
-
-    for operation in ("pause", "camera", "stop"):
-        for confirmed in (True, False):
-            with tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
-                m._select_batch(CargoBatch((11,), ("green_supply",), "material"))
-                m._latch_carried_manifest(CargoAudit(left_class="green_supply", left_count=1, total_count=1))
-                planner = CompetitionPlanner(m, root/"pose", root/"stm", root/"command",
-                                             root/"diag", JsonlLog(root/"events"), 50)
-                request = m._finish_delivery(StmSnapshot(age_ms=0), 1.,
-                    basis="delivery_visual_confirmed" if confirmed else "delivery_visual_timeout",
-                    message="fixture", event="")
-                planner._publish(request)
-                done = StmSnapshot(mode=16, age_ms=0, context_valid=True, task_id=planner.protocol_task,
-                                   action_id=planner.protocol_action, accepted_command=CMD_TASK_COMPLETE,
-                                   action_status=3)
-                planner.pause_reason = "manual" if operation == "pause" else "camera"
-                for unrelated in (replace(done, action_id=(done.action_id - 1) & 0xffff),
-                                  replace(done, action_status=1), replace(done, flags=2)):
-                    out = planner._output_for_cycle(VisionSnapshot(), PoseSnapshot(), unrelated, True, 1.1)
-                    assert out.command.opcode == runner_module.CMD_PAUSE
-                    assert m.delivery_count == 0
-                if operation == "stop":
-                    with patch.object(runner_module, "load_stm", return_value=done), \
-                         patch.object(runner_module, "TERMINATION_ABORT_TIMEOUT_S", 0):
-                        planner.stop("operator_stop", preserve_warm=True)
-                else:
-                    for now in (1.2, 1.3):
-                        out = planner._output_for_cycle(VisionSnapshot(), PoseSnapshot(), done, True, now)
-                        assert out.command.opcode == runner_module.CMD_PAUSE
-                    assert m.state == CompetitionState.TASK_COMPLETE
-                resumed = CompetitionMission(m.settings)
-                restore_progress(resumed, match_progress(m))
-                assert resumed.first_common_delivered == confirmed
-                assert resumed.delivery_count == resumed.orange_search_round == int(confirmed)
-                assert resumed._orange_only_search() == confirmed
 
 
 def test_closed_deflect_runner_carries_pose_and_preserves_motion_action():
@@ -3818,77 +3822,6 @@ def test_three_material_wire_preserves_real_green_count_for_filter():
     assert wire.unknown_present and wire.left_class=='unknown'
 
 
-def test_orange_gate_filter_planner_pairs_completion_pause_and_rejection():
-    from dataclasses import replace
-    from protocol import CMD_ORANGE_GATE_FILTER, CMD_CARGO_AUDIT, CMD_PAUSE
-    from state_machine import CargoAudit, CargoBatch
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        m = CompetitionMission(CompetitionSettings(side='blue', initial_stash_enabled=False))
-        m.first_common_delivered = True
-        m._select_batch(CargoBatch((1,), ('injured_orange',), 'injury'))
-        m._latch_carried_manifest(CargoAudit(right_class='injured_orange', right_count=1, total_count=1))
-        planner = CompetitionPlanner(m, root/'pose', root/'stm', root/'command', root/'diagnostic',
-                                     JsonlLog(root/'events'), 50)
-        status = StmSnapshot(mode=48, flags=3, age_ms=0, camera_pitch_cdeg=14000)
-        current = PoseSnapshot(True, m.settings.injury_target_x_m, m.settings.safe_staging_y_m, 270., 0.)
-        view = VisionSnapshot(frame_sequence=10, observed_monotonic_s=1.)
-        output = m._begin_orange_gate_filter('left', status, 1.)
-        planner._publish(output, stm=status)
-        action = planner.protocol_action
-        assert (root/'command').read_bytes()[19] == CMD_ORANGE_GATE_FILTER
-        done = replace(status, context_valid=True, task_id=planner.protocol_task, action_id=action,
-                       accepted_command=CMD_ORANGE_GATE_FILTER, action_status=3)
-        for old in (replace(done, task_id=done.task_id-1), replace(done, action_id=action-1),
-                    replace(done, action_status=1)):
-            result = planner._output_for_cycle(view, current, old, False, 1.1)
-            assert result.command == output.command and m.state == CompetitionState.ORANGE_GATE_FILTER
-        paused = planner._output_for_cycle(view, current, done, True, 1.2)
-        assert paused.command.opcode == CMD_PAUSE and m.orange_gate_filter_attempted
-        result = planner._output_for_cycle(view, current, done, False, 1.3)
-        assert result.state == CompetitionState.TRANSPORT_AUDIT
-        assert result.command.opcode == CMD_CARGO_AUDIT and not result.command.audit.stable
-        assert m.orange_gate_filter_attempted and m.confirmed_load_audit is None
-        # A new fixture request rejected before acceptance falls back to the
-        # original audit without trying this manoeuvre repeatedly.
-        output = m._begin_orange_gate_filter('right', status, 2.)
-        planner._publish(output, stm=status)
-        reject = replace(done, action_id=action, accepted_command=CMD_CARGO_AUDIT, action_status=5,
-                         rejected_action_id=planner.protocol_action)
-        stale = replace(reject, rejected_action_id=planner.protocol_action-1)
-        assert planner._reconcile_orange_gate_filter_rejection(view,current,stale,2.1) is None
-        already_accepted = replace(reject, action_id=planner.protocol_action,
-                                  accepted_command=CMD_ORANGE_GATE_FILTER)
-        assert planner._reconcile_orange_gate_filter_rejection(view,current,already_accepted,2.1) is None
-        result = planner._output_for_cycle(view, current, reject, False, 2.2)
-        assert result.event == 'orange_gate_filter_rejected'
-        assert m.state == CompetitionState.TRANSPORT_AUDIT and m.orange_gate_filter_attempted
-
-
-def test_orange_gate_filter_keeps_explicit_roi_side_separate_from_old_fallback():
-    from types import SimpleNamespace
-    from unittest.mock import patch
-    from capture_roi import CaptureRois
-    from state_machine import CargoBatch, TrackedCargo
-    m = CompetitionMission(CompetitionSettings(side='blue', initial_stash_enabled=False))
-    m.first_common_delivered = True
-    m._select_batch(CargoBatch((1,), ('injured_orange',), 'injury'))
-    orange = TrackedCargo(1,'injured_orange',.9,(750,300,80,100),hits=3)
-    black = TrackedCargo(2,'core_black',.9,(300,300,80,100),hits=3)
-    overall=((100,100),(1100,100),(1100,800),(100,800))
-    right=((700,100),(1100,100),(1100,800),(700,800))
-    # Real overall-only inclusion still uses the OLD side fallback for audits,
-    # but it must not invent explicit side evidence for the new manoeuvre.
-    for left in ((), ((100,100),(600,100),(600,800),(100,800))):
-        with patch.object(runner_module,'tracked_cargo',return_value=(orange,black)):
-            view=runner_module.make_vision_snapshot([],[],SimpleNamespace(calibrated=False),None,
-                StmSnapshot(mode=48,flags=3,age_ms=0,camera_pitch_cdeg=14000),m,1,
-                capture_rois=CaptureRois(overall,left,right))
-        assert view.capture_audit.total_count == 2
-        assert view.capture_audit.left_class == 'core_black'
-        assert dict(view.capture_explicit_sides).get(2) == ('left' if left else None)
-
-
 def test_aux3_replay_and_real_publisher():
     from dataclasses import replace
     from types import SimpleNamespace
@@ -4059,7 +3992,7 @@ def test_first_green_drops_blue_side_even_with_more_greens_and_overlapping_boxes
     clean=replace(a,left_count=1,left_green_count=1,left_class_counts=(('green_supply',1),),
         right_count=2,right_green_count=2,right_class='green_supply',right_class_counts=(('green_supply',2),),
         right_invalid=False,danger_present=False,total_count=3)
-    assert m._preferred_keep_side(clean)=='left'
+    assert m._preferred_keep_side(clean)=='right'
 
 
 def test_delivery_exit_is_published_and_timed_once(tmp_path):
@@ -4107,3 +4040,98 @@ def test_map_recording_toggle_uses_click_and_preserves_current_warm_session(tmp_
     app.apply_recording_choice()
     assert not app.recording and os.environ["RDK_MATCH_RECORDING"] == "0"
     assert app.runtime.parent == Path("/dev/shm") and app.warm_status_path.parent == app.runtime
+
+
+def test_corridor_nudge_only_once_for_single_near_obstacle_then_realign_or_sweep():
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from state_machine import CargoBatch
+    from protocol import CMD_CORRIDOR_NUDGE, CMD_TARGET_RIGHT
+    from rescue_vision.localizer import ApproachRangeCalibration
+
+    calibration = ApproachRangeCalibration.load(ROOT.parent / "vision/config/approach_range.json")
+    bands = calibration.data["angles"]["12000"]["bands"]
+    for pitch in (11500, 12000):
+        for band in bands:
+            item = SimpleNamespace(visible=True, center_px=(400, (band["y_min"]+band["y_max"])//2))
+            expected = {"B1": None, "B2": 300, "B3": 230, "B4": 100, "B5": 50}[band["band"]]
+            assert runner_module.corridor_nudge_distance([item], pitch, calibration) == expected
+            assert runner_module.corridor_nudge_distance([item, item], pitch, calibration) is None
+    for side, x in (("red", 700), ("blue", 430)):
+        m = CompetitionMission(CompetitionSettings(side=side, initial_stash_enabled=False, bulldozer_enabled=True))
+        m.first_common_delivered = True
+        m._select_batch(CargoBatch((3,), ("green_supply",), "material"))
+        m.confirmed_delivery_destination = "material"
+        pose = PoseSnapshot(True, m.settings.material_target_x_m, m.settings.safe_staging_y_m,
+                            m.settings.safe_heading_deg, 0.)
+        stm = StmSnapshot(mode=11, flags=2, age_ms=0, camera_pitch_cdeg=11500)
+        view = VisionSnapshot(safe_corridor_obstacle_class="danger_cyan", safe_corridor_obstacle_count=1,
+            safe_corridor_obstacle_bbox=(x, 200, 90, 90), safe_corridor_obstacle_distance_mm=230)
+        for multi in (replace(view, safe_corridor_obstacle_count=2),
+                      replace(view,safe_corridor_obstacle_distance_mm=None)):
+            assert m._blocked_corridor_output(multi,stm,1.,pose=pose).event == "bulldozer_start"
+            assert m.obstacle_route.kind == "sweep"
+            m.obstacle_route = None
+        assert m._blocked_corridor_output(view, stm, 2., pose=replace(pose,y_m=0.)).reason == "corridor_return_to_staging"
+        cmd = m._blocked_corridor_output(view, stm, 3., pose=pose).command
+        assert cmd.opcode == CMD_CORRIDOR_NUDGE and (cmd.arg_a, cmd.arg_b) == (100,230)
+        assert bool(cmd.flags & CMD_TARGET_RIGHT) == (x>640)
+        cmd.to_frame(1)
+        done = replace(stm, mode=10, context_valid=True, context_matches=True, accepted_command=cmd.opcode, action_status=3)
+        assert m.step(view,pose,replace(done,context_matches=False),4.).command == cmd
+        assert m.step(view,pose,done,4.1).state == CompetitionState.ALIGN_SAFE_ZONE_BY_POSE
+        retry = m._blocked_corridor_output(replace(view,safe_corridor_obstacle_class="green_supply"),stm,5.,pose=pose)
+        assert retry.event == "bulldozer_start" and m.obstacle_route.kind == "sweep"
+
+
+def test_nudge_credit_clear_pushes_only_remaining_and_blocked_repairs_staging():
+    from dataclasses import replace
+    from state_machine import CargoBatch, STM_MODE_NUDGE_CREDIT_READY
+    from protocol import CMD_CORRIDOR_NUDGE, CMD_ENTER_SAFE_ZONE
+    for side in ("blue", "red"):
+        for blocked in (False, True):
+            m = CompetitionMission(CompetitionSettings(side=side,initial_stash_enabled=False,bulldozer_enabled=True))
+            m.first_common_delivered = True
+            m._select_batch(CargoBatch((7,), ("core_black",), "material"))
+            m.confirmed_delivery_destination = "material"
+            pose = PoseSnapshot(True,m.settings.material_target_x_m,m.settings.safe_staging_y_m,m.settings.safe_heading_deg,0.)
+            st = StmSnapshot(mode=11,flags=2,age_ms=0,camera_pitch_cdeg=11500)
+            obstacle = VisionSnapshot(safe_corridor_obstacle_class="danger_cyan",safe_corridor_obstacle_count=1,
+                                      safe_corridor_obstacle_bbox=(750,400,90,90),safe_corridor_obstacle_distance_mm=230)
+            assert m._blocked_corridor_output(obstacle,st,1.,pose=pose).command.opcode == CMD_CORRIDOR_NUDGE
+            advanced = replace(pose,y_m=pose.y_m+.23*m.settings.side_sign)
+            done = replace(st,mode=STM_MODE_NUDGE_CREDIT_READY,context_valid=True,context_matches=True,
+                           accepted_command=CMD_CORRIDOR_NUDGE,action_status=3)
+            assert m.step(obstacle,advanced,done,1.2).state == CompetitionState.ALIGN_SAFE_ZONE_BY_POSE
+            assert m.nudge_forward_position
+            m.safe_zone_visual_locked = True
+            m.safe_zone_view_pitch_cdeg = st.camera_pitch_cdeg
+            m._begin_safe_corridor_check(obstacle,1.3)
+            frame=replace(obstacle,safe_bbox=(500,0,480,200),frame_sequence=42,observed_monotonic_s=1.4,safe_corridor_polygon=((0,0),(4,0),(4,4)),
+                          safe_corridor_obstacle_class="danger_cyan" if blocked else None)
+            out=m.step(frame,advanced,st,1.4)
+            if blocked:
+                assert out.reason=="corridor_return_to_staging" and not m.nudge_forward_position
+            else:
+                assert out.command.opcode==CMD_ENTER_SAFE_ZONE and out.command.arg_a==-1
+                out.command.to_frame(1)
+
+
+def test_repush_wheel_policy_restores_on_reverse_and_relatches_at_contact():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from dataclasses import replace
+    from run_competition_rescue import LocalizationWheelPolicy
+    from protocol import CMD_ENTER_SAFE_ZONE
+    from state_machine import STM_MODE_REPUSH_OPENED, STM_MODE_REPUSH_RETREAT, STM_MODE_REPUSH_FORWARD
+    policy = LocalizationWheelPolicy("@test-repush-wheel", "test")
+    policy.socket=Mock()
+    out=SimpleNamespace(state=CompetitionState.ENTER_SAFE_ZONE,command=None)
+    st=StmSnapshot(mode=10,context_valid=True,context_matches=True,task_id=7,action_id=12,
+                   accepted_command=CMD_ENTER_SAFE_ZONE,action_status=1)
+    for mode,depth,disabled in [(10,1.04,True),(STM_MODE_REPUSH_OPENED,1.03,False),
+            (STM_MODE_REPUSH_RETREAT,1.04,False),(STM_MODE_REPUSH_FORWARD,.95,False),
+            (STM_MODE_REPUSH_FORWARD,1.03,True),(STM_MODE_REPUSH_FORWARD,1.00,True),(16,1.05,False)]:
+        policy.update(out,replace(st,mode=mode),7,12,depth_m=depth)
+        assert policy.suppressed == disabled
+    policy.close()

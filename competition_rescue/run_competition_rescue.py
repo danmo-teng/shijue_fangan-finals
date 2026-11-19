@@ -69,7 +69,7 @@ from protocol import (  # noqa: E402
     CMD_TASK_COMPLETE,
     CMD_BULLDOZER_STEP,
     CMD_CLOSED_DEFLECT,
-    CMD_ORANGE_GATE_FILTER,
+    CMD_CORRIDOR_NUDGE,
     CMD_DISPERSE_NEAR_KEEP,
     CMD_GRAB_CONFIRMED,
     CMD_HOLD,
@@ -120,6 +120,9 @@ from state_machine import (  # noqa: E402
     STM_MODE_FACE_FIELD_CENTER,
     STM_MODE_SEARCH,
     STM_MODE_REMOTE_ACTION,
+    STM_MODE_NUDGE_CREDIT_READY,
+    STM_MODE_REPUSH_OPENED,
+    STM_MODE_REPUSH_FORWARD,
     cargo_in_front_region,
 )
 
@@ -442,8 +445,11 @@ def audit_from_cargo(
     side_by_track: dict[int, str] | None = None,
     *,
     isolated_track_ids: set[int] | None = None,
+    remembered_items: tuple[TrackedCargo, ...] = (),
 ) -> CargoAudit | None:
-    visible = [item for item in items if item.visible]
+    # Remembered positives are explicitly supplied only by the closed-load
+    # evidence path. Their detector visibility stays false in snapshots/logs.
+    visible = [item for item in items if item.visible] + list(remembered_items)
     if not visible:
         return CargoAudit()
     side_by_track = side_by_track or {}
@@ -515,7 +521,6 @@ def audit_from_cargo(
             item.class_name == "green_supply" for item in right
         ),
         total_count=len(visible),
-        unassigned_count=len(unassigned),
         danger_present=has_danger,
         unknown_present=bool(all_names - {"green_supply", "core_black", "injured_orange", "danger_cyan"}) or bool(unassigned),
         injury_mixed=injury_mixed,
@@ -835,6 +840,21 @@ def safe_zone_push_corridor(
     return polygon, obstacle, None, SAFE_CORRIDOR_BLOCKED
 
 
+def corridor_nudge_distance(items, pitch, calibration):
+    if len(items) != 1 or pitch not in {11500, 12000} or calibration is None or not items[0].visible:
+        return None
+    center = items[0].center_px
+    distance, _ = calibration.distance(12000, center, (IMAGE_WIDTH, IMAGE_HEIGHT))
+    if distance is None:
+        return None
+    bands = calibration.data["angles"]["12000"]["bands"]
+    for band in bands:
+        if band["y_min"] <= center[1] < band["y_max"]:
+            # Only the obstacle-clearing stroke uses these overrides.
+            return {"B2": 300, "B3": distance, "B4": distance, "B5": 50}.get(band["band"])
+    return None
+
+
 def sweep_obstacle_policy(items, safe_bbox, pitch, calibration):
     """Pixel decisions only; 115 uses the user-approved 120 band layout."""
     if safe_bbox is None or pitch not in {11500, 12000}:
@@ -884,6 +904,65 @@ def capture_image_quality(image, pixel_format: str, rois: CaptureRois,
             float(np.mean((pixels < 5) | (pixels > 250))) > 0.95):
         return "capture_image_obscured"
     return ""
+
+
+class HeldCargoEvidence:
+    """Positive 140-degree load evidence, scoped to physical claw holding.
+
+    This is not a detector track or a fresh observation. It only prevents an
+    already seen casualty/material mixture becoming legal on missed frames.
+    Opening, releasing or separating the load clears the evidence.
+    """
+
+    HOLD_MODES = frozenset({10, 11, 22, 23, 40, 48, 51})
+
+    def __init__(self):
+        self.items: dict[str, tuple[TrackedCargo, int]] = {}
+        self.view_140_confirmed = False
+
+    def clear(self):
+        self.items.clear()
+        self.view_140_confirmed = False
+
+    def observe(self, cargo, stm, rois, frame_sequence, image_quality_reason, partial_orange_ids=()):
+        if not stm.gripper_closed or stm.mode not in self.HOLD_MODES:
+            self.clear()
+            return
+        if stm.camera_pitch_cdeg != 14000:
+            self.view_140_confirmed = False
+            return
+        if stm.claw_visible:
+            self.view_140_confirmed = True
+        if not self.view_140_confirmed or image_quality_reason:
+            return
+        for item in cargo:
+            if (not item.visible or item.hits < 2 or
+                    item.class_name not in {"green_supply", "core_black", "injured_orange", "danger_cyan"}):
+                continue
+            if item.track_id in partial_orange_ids:
+                self.items[item.class_name]=(item,frame_sequence)
+                continue
+            x, y, width, height = item.bbox
+            if (x <= 0 or y <= 0 or x + width >= IMAGE_WIDTH - 1 or
+                    y + height >= IMAGE_HEIGHT - 1):
+                continue
+            if bbox_in_capture_roi(item.bbox, rois.overall, minimum_overlap_ratio=capture_overlap_for_class(item.class_name),
+                                   require_bottom_center=item.class_name != "green_supply"):
+                self.items[item.class_name] = (item, frame_sequence)
+
+    def missing_incompatible(self, current):
+        classes = {item.class_name for item in current}
+        combined = classes | self.items.keys()
+        mixed_injury = ('injured_orange' in combined and
+                        bool(combined.intersection({'green_supply','core_black'})))
+        mixed_danger = ('danger_cyan' in combined and
+                        bool(combined.intersection({'green_supply','core_black','injured_orange'})))
+        if not current or not (mixed_injury or mixed_danger):
+            return ()
+        # Keep one actual positive example of each missing incompatible class;
+        # never extrapolate counts or manufacture cargo in an empty picture.
+        return tuple((replace(item, visible=False), frame)
+                     for name, (item, frame) in self.items.items() if name not in classes)
 
 
 def partial_orange_mixed_evidence(cargo, capture, polygon):
@@ -947,6 +1026,7 @@ def make_vision_snapshot(
     recent_carried_track_ids: tuple[int, ...] = (),
     recent_corridor_obstacle: TrackedCargo | None = None,
     recent_carried_pitch_cdeg: int = 0,
+    held_cargo_evidence: HeldCargoEvidence | None = None,
     grip_bands: GripBands | None = None,
     safe_zone_memory: SafeZoneCargoMemory | None = None,
     black_delivery: SingleBlackDelivery | None = None,
@@ -977,7 +1057,6 @@ def make_vision_snapshot(
     roi_started = time.monotonic()
     capture_items: list[TrackedCargo] = []
     capture_side_by_track: dict[int, str] = {}
-    capture_explicit_sides: dict[int, str] = {}
     capture_enabled = (
         stm.audit_fresh and
         stm.claw_visible and
@@ -987,10 +1066,11 @@ def make_vision_snapshot(
                                  not capture_quality_reason)
     image_observation_valid = capture_observation_valid
     image_quality_reason = capture_quality_reason
+    claw_cargo = tracked_cargo(tracks, None) if capture_enabled or held_cargo_evidence is not None else ()
     target_quality: dict[int, str] = {}
     roi_decisions = []
     if capture_enabled:
-        for item in tracked_cargo(tracks, None):
+        for item in claw_cargo:
             if not item.visible:
                 continue
             x, y, width, height = item.bbox
@@ -1027,21 +1107,31 @@ def make_vision_snapshot(
                 minimum_overlap_ratio=capture_overlap,
                 overall_included=included,
             )
-            if capture_side is not None:
-                capture_side_by_track[item.track_id] = capture_side
-                capture_explicit_sides[item.track_id] = capture_side
+            capture_side_by_track[item.track_id] = capture_side or (
+                "left" if item.center_px[0] <= IMAGE_WIDTH // 2 else "right"
+            )
     partial_orange_ids = set()
     if capture_enabled and stm.gripper_closed:
         for item in partial_orange_mixed_evidence(cargo,capture_items,rois.overall):
             capture_items.append(item);partial_orange_ids.add(item.track_id)
-            side = capture_side_for_bbox(item.bbox, rois, overall_included=True)
-            if side is not None:
-                capture_side_by_track[item.track_id] = side
-                capture_explicit_sides[item.track_id] = side
+            capture_side_by_track[item.track_id] = 'left' if item.center_px[0] <= IMAGE_WIDTH//2 else 'right'
             for decision in roi_decisions:
                 if decision['track_id']==item.track_id:
                     decision.update(included=True,reason='partial_orange_mixed_separation_only',transport_eligible=False)
     capture = tuple(capture_items)
+    remembered_capture = ()
+    if held_cargo_evidence is not None:
+        held_cargo_evidence.observe(claw_cargo, stm, rois,
+                                   frame_sequence, image_quality_reason, partial_orange_ids)
+        if capture_enabled and capture_observation_valid:
+            remembered_capture = held_cargo_evidence.missing_incompatible(capture)
+            for item, source_frame in remembered_capture:
+                capture_side_by_track[item.track_id] = capture_side_for_bbox(
+                    item.bbox, rois, minimum_overlap_ratio=0.60, overall_included=True,
+                ) or ("left" if item.center_px[0] <= IMAGE_WIDTH // 2 else "right")
+                roi_decisions.append(dict(track_id=item.track_id, **{"class": item.class_name},
+                    included=True, reason="held_incompatible_cargo_remembered",
+                    remembered_source_frame=source_frame))
     for index, item in enumerate(capture):
         for other in capture[index + 1:]:
             if item.track_id in partial_orange_ids or other.track_id in partial_orange_ids:
@@ -1051,7 +1141,8 @@ def make_vision_snapshot(
                 known_pair = (
                     (stm.mode in {21, 35, 37, 38} or
                      (stm.mode in {23, 48} and stm.gripper_closed and
-                      item.class_name in MATERIAL_CLASSES and other.class_name in MATERIAL_CLASSES)) and
+                      ((item.class_name in MATERIAL_CLASSES and other.class_name in MATERIAL_CLASSES) or
+                       {item.class_name, other.class_name} == {"injured_orange", "core_black"}))) and
                     item.track_id != other.track_id and item.bbox != other.bbox and
                     item.hits >= 2 and other.hits >= 2 and
                     item.class_name in {"green_supply", "core_black", "injured_orange"} and
@@ -1059,9 +1150,8 @@ def make_vision_snapshot(
                     not target_quality.get(item.track_id) and not target_quality.get(other.track_id)
                 )
                 if known_pair:
-                    # Overlap is not missing evidence when distinct green/core
-                    # boxes are still visible after closure. Count every real
-                    # item; the original audit still rejects mixed/overfull loads.
+                    # Count distinct, identified items. The cargo audit decides
+                    # whether this composition can travel or needs separation.
                     continue
                 capture_observation_valid = False
                 if capture_quality_reason != "claw_target_truncated":
@@ -1090,6 +1180,7 @@ def make_vision_snapshot(
                     not mission._boxes_overlap(item.bbox, other.bbox)
                     for other in capture)
             },
+            remembered_items=tuple(item for item, _ in remembered_capture),
         )
         if capture_observation_valid else None
     )
@@ -1123,7 +1214,8 @@ def make_vision_snapshot(
     sweep_observation_valid = capture_observation_valid
     sweep_quality_reason = capture_quality_reason
     sweep_audit = (
-        audit_from_cargo(sweep_capture, set(), capture_side_by_track)
+        audit_from_cargo(sweep_capture, set(), capture_side_by_track,
+                         remembered_items=tuple(item for item, _ in remembered_capture))
         if sweep_observation_valid and mission.safe_sweep_pickup is not None else None
     )
     if sweep_audit is not None and near_hint is not None:
@@ -1239,7 +1331,7 @@ def make_vision_snapshot(
     (
         corridor,
         corridor_obstacle,
-        corridor_distance_mm,
+        _,
         corridor_status,
     ) = safe_zone_push_corridor(
         cargo,
@@ -1309,7 +1401,6 @@ def make_vision_snapshot(
         cargo=cargo,
         capture_cargo=capture,
         zone_boxes=zone_boxes, clipped_zone_candidates=tuple(clipped_candidates),
-        capture_explicit_sides=tuple(capture_explicit_sides.items()),
         safe_bbox=safe_bbox,
         danger_ahead=danger,
         danger_side=side,
@@ -1333,7 +1424,8 @@ def make_vision_snapshot(
         safe_corridor_obstacle_classes=tuple(sorted(set(corridor_classes))),
         safe_corridor_edge_obstacle=corridor_edge,
         safe_corridor_b34_obstacle=corridor_b34,
-        safe_corridor_obstacle_distance_mm=corridor_distance_mm,
+        safe_corridor_obstacle_count=len(corridor_items),
+        safe_corridor_obstacle_distance_mm=corridor_nudge_distance(corridor_items, stm.camera_pitch_cdeg, range_calibration),
         safe_corridor_obstacle_track_id=(
             None if corridor_obstacle is None else corridor_obstacle.track_id
         ),
@@ -1492,7 +1584,9 @@ class LocalizationWheelPolicy:
         self.suppressed = False
         self.last_sent = None
         self.sequence = 0
-        self.contact_task = None
+        self.contact_owner = None
+        self.round_token = None
+        self.push_owner = self.checked_owner = None
         self.error = None
 
     def _event(self, name, **data):
@@ -1502,38 +1596,60 @@ class LocalizationWheelPolicy:
             except (OSError, ValueError):
                 pass  # A diagnostic write must not block command publication.
 
-    def update(self, output, stm, task_id, action_id, *, depth_m=None):
+    def update(self, output, stm, task_id, action_id, *, depth_m=None, side_sign=None, visual_delivery=False):
         if self.closed:
             return
         interrupted = stm.fault or (output.command is not None and output.command.opcode in {CMD_ABORT, CMD_PAUSE})
-        if interrupted or (self.contact_task is not None and task_id != self.contact_task):
-            self.contact_task = None
-        elif stm.context_valid and stm.action_status & 1:
-            if self.contact_task is not None:
-                # ENTER or an early COMPLETE can own the first opening report.
-                if stm.task_id == self.contact_task and stm.mode != STM_MODE_NAVIGATE:
-                    self.contact_task = None
-            elif (output.state == CompetitionState.ENTER_SAFE_ZONE and stm.context_matches
-                  and stm.task_id == task_id and stm.action_id == action_id
-                  and stm.accepted_command == CMD_ENTER_SAFE_ZONE and stm.mode == STM_MODE_NAVIGATE
-                  and depth_m is not None and depth_m >= self.CONTACT_DEPTH_M):
-                self.contact_task = task_id
-        self.suppressed = self.contact_task is not None
-        self._send(output.state.value, task_id, action_id)
+        owner = (stm.task_id, stm.action_id, stm.mode)
+        if interrupted or (self.contact_owner is not None and
+                (task_id != self.contact_owner[0] or
+                 (stm.context_valid and stm.task_id == task_id and stm.action_status & 1 and
+                  (stm.action_id, stm.mode) != self.contact_owner[1:]))):
+            self.contact_owner = None
+        current_push = (output.state == CompetitionState.ENTER_SAFE_ZONE and stm.context_matches and
+                        stm.action_id == action_id and stm.mode in {STM_MODE_NAVIGATE, STM_MODE_REPUSH_FORWARD})
+        finishing_repush = (output.state == CompetitionState.TASK_COMPLETE and stm.mode == STM_MODE_REPUSH_FORWARD and
+                            self.push_owner == (stm.task_id, stm.action_id))
+        if (not interrupted and (current_push or finishing_repush) and stm.context_valid and stm.action_status & 1 and
+                stm.task_id == task_id and stm.accepted_command == CMD_ENTER_SAFE_ZONE and
+                depth_m is not None and depth_m >= self.CONTACT_DEPTH_M):
+            self.contact_owner = owner
+        if (not interrupted and stm.context_matches and stm.mode == STM_MODE_NAVIGATE and
+                stm.accepted_command == CMD_ENTER_SAFE_ZONE and stm.action_status & 1):
+            self.push_owner = (task_id, action_id)
+        self.suppressed = self.contact_owner is not None
+        checkpoint = None
+        # An early visual COMPLETE in opening, or ENTER completed in the
+        # stationary verification state. A local push timeout can bypass both.
+        normal_open = ((stm.mode == STM_MODE_REPUSH_OPENED and stm.accepted_command == CMD_ENTER_SAFE_ZONE) or
+                       (stm.mode == 12 and stm.accepted_command == CMD_TASK_COMPLETE
+                        and visual_delivery) or
+                       (stm.mode == 15 and stm.accepted_command == CMD_ENTER_SAFE_ZONE and stm.action_status & 2))
+        if (not interrupted and normal_open and stm.context_valid and stm.action_status & 1
+                and self.push_owner is not None and stm.task_id == task_id == self.push_owner[0]
+                and (stm.context_matches or (stm.task_id, stm.action_id) == self.push_owner)
+                and self.checked_owner != self.push_owner
+                and self.round_token and side_sign in (-1, 1) and stm.received_monotonic_ns):
+            checkpoint = dict(unload_reference_y_m=side_sign*self.CONTACT_DEPTH_M,
+                unload_report_ns=stm.received_monotonic_ns, round_token=self.round_token)
+        if self._send(output.state.value, task_id, action_id, checkpoint) and checkpoint:
+            self.checked_owner = self.push_owner
 
     def release_contact(self):
-        if self.contact_task is not None or self.last_sent is True:
-            self.contact_task = None
+        if self.contact_owner is not None or self.last_sent is True:
+            self.contact_owner = None
             self.suppressed = False
             self._send("stop", 0, 0)
 
-    def _send(self, state, task_id, action_id):
-        if self.last_sent == self.suppressed:
+    def _send(self, state, task_id, action_id, checkpoint=None):
+        if self.last_sent == self.suppressed and checkpoint is None:
             return
         packet = dict(schema=1, kind='competition_wheel_policy', session_id=self.session_id,
                       sequence=self.sequence, suppressed=self.suppressed,
                       reason='delivery_contact_zero_translation' if self.suppressed else 'normal_motion',
                       state=state, task_id=task_id, action_id=action_id)
+        if checkpoint:
+            packet.update(checkpoint)
         try:
             if self.socket is None:
                 self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -1548,6 +1664,7 @@ class LocalizationWheelPolicy:
         self.last_sent = self.suppressed
         self.sequence += 1
         self._event('localization_wheel_policy_sent', policy=packet)
+        return True
 
     def close(self):
         self.release_contact()
@@ -1832,8 +1949,6 @@ class CompetitionPlanner:
         abort_sequence = self.sequence
         abort_frame = abort_command.to_frame(abort_sequence)
         before = load_stm(self.stm_path)
-        if preserve_warm and not self.thread.is_alive():
-            self._observe_completed_delivery(before)
         result = {
             "attempted": True,
             "reason": reason,
@@ -1902,7 +2017,9 @@ class CompetitionPlanner:
                        stm.action_id == self.protocol_action)
             self.localization_wheel_policy.update(output, replace(stm, context_matches=matched),
                 self.protocol_task, self.protocol_action,
-                depth_m=(self.mission.settings.side_sign * pose.y_m if pose is not None and pose.valid else None))
+                depth_m=(self.mission.settings.side_sign * pose.y_m if pose is not None and pose.valid else None),
+                side_sign=self.mission.settings.side_sign,
+                visual_delivery=self.mission.delivery_completion_basis in ("delivery_visual_early", "delivery_visual_confirmed"))
         if output.suppress_command_tx:
             return
         command = output.command or CommandRequest(CMD_HOLD)
@@ -2199,12 +2316,15 @@ class CompetitionPlanner:
         # so publishing does not allocate a new action or restart the MCU.
         self.protocol_action_key = (command.opcode, command.flags, None, None, None)
         self.protocol_vision_frame = command.source_vision_frame or 0
+        if pending.opcode == CMD_ENTER_SAFE_ZONE and pending.arg_a == -1 and command.opcode == CMD_ALIGN_SAFE_ZONE:
+            self.mission.nudge_forward_position = False  # Credit rejected; stage before an uncredited ENTER.
         if self.mission.state == CompetitionState.OBSTACLE_ROUTE:
             self.mission.obstacle_route = None  # The rejected first step never executed.
         if restored_state == CompetitionState.ENTER_SAFE_ZONE:
             self.mission._set_state(restored_state, now)
             self.mission.enter_command_published = True
             self.mission.enter_command_accepted = True
+            self.mission.nudge_forward_position = command.arg_a == -1
             self.mission.safe_zone_visual_locked = bool(command.flags & CMD_VISUAL_CORRECTION_VALID)
         else:
             visual = bool(command.flags & CMD_VISUAL_CORRECTION_VALID)
@@ -2315,26 +2435,6 @@ class CompetitionPlanner:
             message="下位机明确拒绝当前扫障请求，按实际模式恢复目标查找或新帧审核",
         )
 
-    def _reconcile_orange_gate_filter_rejection(
-        self, vision: VisionSnapshot, pose: PoseSnapshot, stm: StmSnapshot, now: float,
-    ) -> CompetitionOutput | None:
-        pending = self.protocol_last_output.command if self.protocol_last_output else None
-        if not (self.mission.state == CompetitionState.ORANGE_GATE_FILTER and
-                pending is not None and pending.opcode == CMD_ORANGE_GATE_FILTER and
-                stm.context_valid and stm.mode == STM_MODE_TRANSPORT_AUDIT and not stm.fault and
-                stm.action_status & 4 and stm.task_id == self.protocol_task and
-                stm.rejected_action_id == self.protocol_action):
-            return None
-        if (stm.action_id == self.protocol_action and stm.accepted_command == pending.opcode and
-                stm.action_status & 1):
-            return None  # A rejected duplicate cannot cancel an executing action.
-        self._adopt_recovery_context()
-        self.mission.orange_gate_filter_command = None
-        return replace(self.mission._begin_transport_audit(
-            vision, pose, replace(stm, context_matches=True), now),
-            event="orange_gate_filter_rejected", reason="orange_gate_filter_rejected",
-            message="门口横移请求未被接受，保留本批已尝试记录，重新复审后走原分离")
-
     def _reconcile_separation_rejection(
         self, vision: VisionSnapshot, stm: StmSnapshot, now: float
     ) -> CompetitionOutput | None:
@@ -2404,14 +2504,6 @@ class CompetitionPlanner:
         return replace(result, event="approach_request_rejected",
                        reason="approach_recover_after_reject")
 
-    def _observe_completed_delivery(self, stm: StmSnapshot) -> None:
-        # PAUSE/STOP still own motion. Preserve only a receipt belonging to
-        # the completion already published by this planner.
-        pending = self.protocol_last_output.command if self.protocol_last_output else None
-        if pending is not None and pending.opcode == CMD_TASK_COMPLETE:
-            matches = stm.task_id == self.protocol_task and stm.action_id == self.protocol_action
-            self.mission._observe_delivery_completion(replace(stm, context_matches=matches))
-
     def _output_for_cycle(
         self,
         vision: VisionSnapshot,
@@ -2420,8 +2512,6 @@ class CompetitionPlanner:
         paused: bool,
         now: float,
     ) -> CompetitionOutput:
-        if paused:
-            self._observe_completed_delivery(stm)
         ready_ns = self.view_boundary.observe(stm)
         if (not paused and not stm.fault and stm.received_monotonic_ns and vision.frame_sequence
                 and (stm.mode in (3, 11, 15, 20, 21, 23, 37, 38, 43, 45, 48, 52)
@@ -2592,25 +2682,27 @@ class CompetitionPlanner:
         reconciled = self._reconcile_sweep_rejection(vision, pose, stm, now)
         if reconciled is not None:
             return reconciled
-        reconciled = self._reconcile_orange_gate_filter_rejection(vision, pose, stm, now)
-        if reconciled is not None:
-            return reconciled
         reconciled = self._reconcile_separation_rejection(vision, stm, now)
         if reconciled is not None:
             return reconciled
         reconciled = self._reconcile_approach_rejection(vision, pose, stm, now)
         if reconciled is not None:
             return reconciled
-        if (self.mission.state == CompetitionState.OBSTACLE_ROUTE and not stm.fault and
-                stm.mode in {3, 10, 11, 25}):
+        if (self.mission.state == CompetitionState.CORRIDOR_NUDGE and
+                stm.mode in {10, 11} and stm.context_valid and not stm.fault and
+                stm.task_id == self.protocol_task and stm.action_status & 4 and
+                stm.rejected_action_id == self.protocol_action and
+                not (matches and stm.accepted_command == CMD_CORRIDOR_NUDGE and stm.action_status & 2)):
+            self._adopt_recovery_context()
+            return replace(self.mission._resume_after_corridor_nudge(pose, stm, now),
+                event="corridor_nudge_rejected", message="挤障未完成，回预备线重新对准判障")
+        if (self.mission.state in {CompetitionState.OBSTACLE_ROUTE, CompetitionState.CORRIDOR_NUDGE} and not stm.fault and
+                stm.mode in {3, 10, 11, 25, STM_MODE_NUDGE_CREDIT_READY}):
             # Update live remaining H/D while the first paired status is in
             # flight. Only a matching action may advance the route step.
             return self.mission.step(vision, pose, replace(stm, context_matches=matches), now)
         if (self.mission.state == CompetitionState.INITIAL_ATTACK_RETURN and not stm.fault and
                 stm.mode in {3, 25, 34}):
-            return self.mission.step(vision, pose, replace(stm, context_matches=matches), now)
-        if (self.mission.state == CompetitionState.ORANGE_GATE_FILTER and not stm.fault and
-                stm.mode in {STM_MODE_REMOTE_ACTION, STM_MODE_TRANSPORT_AUDIT}):
             return self.mission.step(vision, pose, replace(stm, context_matches=matches), now)
         if (self.mission.state == CompetitionState.CLOSED_DEFLECT and not stm.fault and
                 stm.mode in {3, 10, 11, 25, 52}):
@@ -2854,9 +2946,6 @@ class CompetitionPlanner:
             "search_points": {str(n): self.mission.settings.search_point(n) for n in (1, 3)},
             "search_visit": self.mission.search_visit,
             "search_site_turn_deg": self.mission.search_site_turn_deg,
-            "orange_search_round": self.mission.orange_search_round,
-            "orange_search_turn_deg": self.mission.orange_search_turn_deg,
-            "orange_only_search": self.mission._orange_only_search(),
             "failed_search_targets": [asdict(r) for r in self.mission.failed_search_targets],
             "safe_sweep_observation": {
                 "key": self.sweep_observation_key,
@@ -2914,6 +3003,7 @@ class CompetitionPlanner:
                 "safe_corridor_polygon": [list(point) for point in vision.safe_corridor_polygon],
                 "safe_sweep_search_polygon": [list(point) for point in vision.safe_sweep_search_polygon],
                 "safe_corridor_obstacle_class": vision.safe_corridor_obstacle_class,
+                "safe_corridor_obstacle_count": vision.safe_corridor_obstacle_count,
                 "safe_corridor_obstacle_distance_mm": vision.safe_corridor_obstacle_distance_mm,
                 "safe_corridor_obstacle_track_id": vision.safe_corridor_obstacle_track_id,
                 "safe_corridor_obstacle_bbox": vision.safe_corridor_obstacle_bbox,
@@ -3655,6 +3745,7 @@ def main() -> int:
     recent_carried_bboxes: tuple[tuple[int, int, int, int], ...] = ()
     recent_carried_track_ids: tuple[int, ...] = ()
     recent_carried_pitch_cdeg = 0
+    held_cargo_evidence = HeldCargoEvidence()
     safe_zone_memory = SafeZoneCargoMemory()
     black_delivery = SingleBlackDelivery()
     competition_started = False
@@ -3744,12 +3835,15 @@ def main() -> int:
         recent_carried_bboxes = ()
         recent_carried_track_ids = ()
         recent_carried_pitch_cdeg = 0
+        held_cargo_evidence.clear()
         safe_zone_memory.clear()
         black_delivery.owner = None
         startup_details.update(side=side,start_zone=start_zone,opening_strategy=opening_strategy,
             startup_pose=pose_dict(load_pose(args.pose)),stash_point_m=list(mission.settings.stash_point))
         operator_start_ready = True
         last_start_reference = request['reference_token']
+        if wheel_policy is not None:
+            wheel_policy.round_token = last_start_reference
         wall_yaw_word = request['reference'].get('wall_yaw_config_word',0)
         events.write('warm_reference_bound', dict(session_token=args.reset_session_token,
             reference=request['reference'],side=side,start_zone=start_zone))
@@ -4041,6 +4135,7 @@ def main() -> int:
                     grip_bands=grip_bands,
                     recent_carried_track_ids=recent_carried_track_ids,
                     recent_carried_pitch_cdeg=recent_carried_pitch_cdeg,
+                    held_cargo_evidence=held_cargo_evidence,
                     safe_zone_memory=safe_zone_memory, black_delivery=black_delivery,
                 )
                 if latest_vision.carried_reference_track_ids:

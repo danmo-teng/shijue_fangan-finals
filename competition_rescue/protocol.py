@@ -32,7 +32,6 @@ CMD_NAVIGATE_WAYPOINT = 0x03
 CMD_ALIGN_SAFE_ZONE = 0x04
 CMD_ENTER_SAFE_ZONE = 0x05
 CMD_TASK_COMPLETE = 0x06
-TASK_COMPLETE_UNCONFIRMED = 1  # TASK_COMPLETE U: exit without a confirmed delivery.
 CMD_ABORT = 0x07
 CMD_RETURN_CENTER = 0x08
 
@@ -51,6 +50,8 @@ CMD_CARGO_AUDIT = 0x12
 CMD_CLEAR_SAFE_ZONE = 0x13
 CMD_BULLDOZER_STEP = 0x14  # Segmented motion; each extension requires matching F405 support.
 CMD_CLOSED_DEFLECT = 0x15  # TYPE=0x18 opcode, unrelated to TYPE=0x15 odometry.
+CMD_ORANGE_CORE_FILTER = 0x18  # Close both claws and use the straight 82-degree filter.
+CMD_CORRIDOR_NUDGE = 0x17  # Closed, lateral/forward/lateral during delivery.
 CMD_ORANGE_GATE_FILTER = 0x16  # Paired firmware: closed lateral out/lower/return.
 
 CMD_VALID = 1 << 0
@@ -73,6 +74,7 @@ CMD_STAGE_ONLY = 1 << 6
 CMD_VISUAL_CORRECTION_VALID = 1 << 6
 CMD_SIDE_VALID = 1 << 6
 CMD_TARGET_RIGHT = 1 << 7
+CMD_KEEP_ORANGE = 1 << 1  # Selective separation only: apply the firmware opening offset to the retained claw.
 CMD_DISPERSE_NEAR_KEEP = 1 << 4  # DISPERSE only: side evidence, never cargo validity.
 SEPARATION_ORANGE_CORE_82 = 8200  # Opcode-specific lift request; not a chassis heading.
 
@@ -146,18 +148,13 @@ def mission_frame(
         raise ValueError("sequence must be in 0..255")
     if not 0 <= command <= 0xFF or not 0 <= flags <= 0xFF:
         raise ValueError("command and flags must be bytes")
-    if command == CMD_TASK_COMPLETE and (
-        not flags & CMD_VALID or flags & ~(CMD_VALID | CMD_RED_SIDE) or
-        arg_a != 0 or arg_b != 0 or aux_cdeg not in {0, TASK_COMPLETE_UNCONFIRMED}
-    ):
-        raise ValueError("invalid task completion payload")
-    if command == CMD_ORANGE_GATE_FILTER:
+    if command in {CMD_ORANGE_CORE_FILTER, CMD_ORANGE_GATE_FILTER}:
+        raise ValueError("lift filter commands are disabled in finals")
+    if command == CMD_CORRIDOR_NUDGE:
         required = CMD_VALID | CMD_SIDE_VALID
-        allowed = required | CMD_RED_SIDE | CMD_TARGET_RIGHT
-        if (flags & required != required or flags & ~allowed or
-                arg_a != 100 or arg_b != 8600 or
-                aux_cdeg != (9000 if flags & CMD_RED_SIDE else 27000)):
-            raise ValueError("orange gate filter requires black side, 100mm, lift86 and safe heading")
+        if (flags & required != required or flags & ~(required | CMD_RED_SIDE | CMD_TARGET_RIGHT) or
+                arg_a != 100 or not 0 < arg_b <= 2500 or aux_cdeg != (9000 if flags & CMD_RED_SIDE else 27000)):
+            raise ValueError("invalid corridor nudge")
     if command == CMD_CLOSED_DEFLECT:
         from closed_deflect import VIEW, PULL, STAGE, CARRYING, END_AT_ORIGINAL
         phase = flags >> 4
@@ -246,10 +243,10 @@ def mission_frame(
         CMD_ENTER_SAFE_ZONE,
         CMD_DISPERSE_PILE,
         CMD_BULLDOZER_STEP,
-        CMD_ORANGE_GATE_FILTER,
+        CMD_CORRIDOR_NUDGE,
     }:
         raise ValueError("bit6 is not valid for this command")
-    if flags & CMD_TARGET_RIGHT and command not in {CMD_DISPERSE_PILE, CMD_BULLDOZER_STEP, CMD_ORANGE_GATE_FILTER}:
+    if flags & CMD_TARGET_RIGHT and command not in {CMD_DISPERSE_PILE, CMD_BULLDOZER_STEP, CMD_CORRIDOR_NUDGE}:
         raise ValueError("TARGET_RIGHT is not valid for this command")
     if command != CMD_BULLDOZER_STEP and flags & CMD_TARGET_RIGHT and not flags & CMD_SIDE_VALID:
         raise ValueError("TARGET_RIGHT requires SIDE_VALID")
@@ -263,17 +260,13 @@ def mission_frame(
         if (not flags & CMD_SIDE_VALID or flags & CMD_FIRST_GREEN_BUMP or
                 arg_a != 0 or arg_b != 0 or aux_cdeg != 0):
             raise ValueError("near-claw keep requires an explicit side and zero motion payload")
+    if command == CMD_DISPERSE_PILE and flags & CMD_KEEP_ORANGE and not flags & CMD_SIDE_VALID:
+        raise ValueError("orange separation requires a retained side")
+    if command == CMD_RELEASE_BOTH and flags & CMD_KEEP_ORANGE:
+        raise ValueError("release both has no retained orange side")
     if command in {CMD_DISPERSE_PILE, CMD_RELEASE_LEFT, CMD_RELEASE_RIGHT}:
-        if arg_a != 0 or arg_b != 0 or aux_cdeg not in {0, SEPARATION_ORANGE_CORE_82}:
-            raise ValueError("separation requires zero motion and a supported lift mode")
-        if aux_cdeg == SEPARATION_ORANGE_CORE_82:
-            allowed = CMD_VALID | CMD_RED_SIDE
-            if command == CMD_DISPERSE_PILE:
-                allowed |= CMD_SIDE_VALID | CMD_TARGET_RIGHT
-                if not flags & CMD_SIDE_VALID:
-                    raise ValueError("82-degree separation requires an explicit retained side")
-            if not flags & CMD_VALID or flags & ~allowed:
-                raise ValueError("invalid 82-degree separation flags")
+        if arg_a != 0 or arg_b != 0 or aux_cdeg != 0:
+            raise ValueError("finals separation uses a zero motion and lift payload")
     if command == CMD_RELEASE_BOTH and aux_cdeg == SEPARATION_ORANGE_CORE_82:
         raise ValueError("release both has no retained orange side")
     if command == CMD_RELEASE_BOTH and aux_cdeg == RELEASE_SAME_SIDE_BLUE:
@@ -286,10 +279,10 @@ def mission_frame(
         if (
             not flags & CMD_DRIVE_STRAIGHT or
             flags & CMD_DISTANCE_VALID or
-            arg_a != 0 or
+            arg_a not in (0, -1) or (arg_a == -1 and not visual) or
             arg_b != 0
         ):
-            raise ValueError("ENTER uses F407 encoder distance with zero D")
+            raise ValueError("ENTER requires zero payload or a visual nudge-credit request")
         if visual:
             if flags & CMD_USE_FINAL_HEADING or aux_cdeg != 0:
                 raise ValueError("visual ENTER must use the latched ALIGN heading")
@@ -302,8 +295,11 @@ def mission_frame(
         allowed_flags = CMD_VALID | CMD_RED_SIDE
         if flags & ~allowed_flags or not flags & CMD_VALID:
             raise ValueError("CLEAR_SAFE_ZONE only allows CMD_VALID and RED_SIDE")
-        if arg_a != 0 or abs(arg_b) != 200:
-            raise ValueError("FinalRun CLEAR_SAFE_ZONE requires visual pickup and +/-200 mm placement")
+        if arg_a != 0 and not 80 <= arg_a <= 600:
+            raise ValueError("CLEAR_SAFE_ZONE uses 0 for visual pickup or legacy 80..600 mm")
+        placement_mm = 200 if arg_a == 0 else 150
+        if abs(arg_b) != placement_mm:
+            raise ValueError("visual CLEAR uses +/-200 mm turn-and-place; legacy CLEAR uses +/-150 mm")
         if aux_cdeg != 0:
             raise ValueError("CLEAR_SAFE_ZONE P6/P7 must be zero")
     payload = (

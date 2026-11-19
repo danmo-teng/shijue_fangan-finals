@@ -1,5 +1,7 @@
 # 决赛载荷、分离与送达配套
 
+历史记录。当前决赛采用[初赛正式流程迁移](CROSS_REPO_REQUESTS.md)。
+
 对应下位 `Final_Run/Final_task@4656c777c3ab2958b2a8e32648b2f97b0a6d9948`。 [下位问卷交接](https://github.com/kkkkkkkkkkkkkkkk222222/Final_Run/blob/4656c777c3ab2958b2a8e32648b2f97b0a6d9948/docs/FINALS_QUESTIONNAIRE_SEPARATION_20261119.md)
 
 ## 正式运输和搬移
