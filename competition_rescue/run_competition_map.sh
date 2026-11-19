@@ -18,7 +18,7 @@ echo "比赛诊断记录 RDK_MATCH_RECORDING=$RDK_MATCH_RECORDING（0关闭，1�
 export RDK_FORMAL_LOCALIZATION_BUILD="${RDK_FORMAL_LOCALIZATION_BUILD:-${project_dir}/localization/build/formal-unload-guard}"
 export LD_LIBRARY_PATH="${project_dir}/build-250/librealsense${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 localizer="$RDK_FORMAL_LOCALIZATION_BUILD/t265_omni_localizer"
-vision_model="${project_dir}/vision/x5_output_640/hardcases_e24_x5_bayese_640x640_nv12.bin"
+vision_model="${project_dir}/yolo26n/x5_output_640_1120_final/yolo26n_6cls_640_1120_final_bpu_bayese_640x640_nv12.bin"
 
 if [[ ! -x "${localizer}" || ! -f "${vision_model}" ]]; then
     echo "完整比赛流程依赖缺失：请确认定位程序和YOLO模型已部署。" >&2
