@@ -21,9 +21,6 @@ except (ImportError, ValueError) as exc:
     ) from exc
 
 
-FINALS_EXPOSURE_100US = 166  # 16.6 ms, closest setting at or below 1/60 s.
-
-
 @dataclass(frozen=True)
 class CameraFrame:
     frame_id: int
@@ -65,7 +62,7 @@ class LatestFrameCamera:
     def __init__(self, device: str, width: int, height: int, fps: int,
                  decoder: str = "jpu", decode_fps: float = 60.0,
                  output_format: str = "bgr", *, use_source_timestamp: bool = False,
-                 exposure_100us: int | None = None) -> None:
+                 enable_auto_exposure: bool = False) -> None:
         Gst.init(None)
         self.width = width
         self.height = height
@@ -103,10 +100,9 @@ class LatestFrameCamera:
                 "appsink name=vision_sink emit-signals=true max-buffers=1 drop=true sync=false"
             )
         self.pipeline = Gst.parse_launch(description)
-        if exposure_100us is not None:
+        if enable_auto_exposure:
             controls = Gst.Structure.new_empty("controls")
-            controls.set_value("auto_exposure", 1)
-            controls.set_value("exposure_time_absolute", exposure_100us)
+            controls.set_value("auto_exposure", 3)  # UVC aperture priority uses automatic exposure.
             self.pipeline.get_by_name("vision_source").set_property("extra-controls", controls)
         self.sink = self.pipeline.get_by_name("vision_sink")
         self.sink.connect("new-sample", self._on_sample)

@@ -124,7 +124,7 @@ def test_camera_reopen_failure_keeps_session_and_waits_for_first_result():
             count=2 if unplug else 4
             assert [call.args[0] for call in cameras.call_args_list] == [str(stable)] * count
             assert [call.kwargs["decoder"] for call in cameras.call_args_list] == ["jpu"] + [recovery_decoder] * (count-1)
-            assert [call.kwargs["exposure_100us"] for call in cameras.call_args_list] == [166] * count
+            assert all(call.kwargs["enable_auto_exposure"] for call in cameras.call_args_list)
             views = [call.args[0].frame_sequence for call in planner.set_vision.call_args_list]
             assert views == [1, 0, 2]  # New camera-local frame 1, same running round.
             rows = [json.loads(line) for line in (root / "events").read_text().splitlines()]

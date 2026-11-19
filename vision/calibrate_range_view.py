@@ -79,13 +79,13 @@ def main() -> int:
         parser.error("--bands须为2..12")
     import cv2
     from run_yolo_x5 import load_labels, DEFAULT_LABELS, DEFAULT_YOLO_SCORE_THRESHOLD
-    from rescue_vision.camera import FINALS_EXPOSURE_100US, LatestFrameCamera, resolve_camera_device
+    from rescue_vision.camera import LatestFrameCamera, resolve_camera_device
     from rescue_vision.vision_protocol import IMAGE_WIDTH, IMAGE_HEIGHT
 
     detector = X5Yolo26(args.model, load_labels(DEFAULT_LABELS), DEFAULT_YOLO_SCORE_THRESHOLD, .45, 0, [0])
     camera = LatestFrameCamera(resolve_camera_device(args.device), IMAGE_WIDTH, IMAGE_HEIGHT, 180,
                                decoder="jpu", decode_fps=15, output_format="bgr",
-                               exposure_100us=FINALS_EXPOSURE_100US)
+                               enable_auto_exposure=True)
     layout = RangeBands(args.output / "layouts", IMAGE_WIDTH, IMAGE_HEIGHT, args.bands)
     window = "Finals range calibration: drag lines | 1=105 2=120 SPACE=freeze S=save Q=quit"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
