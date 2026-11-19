@@ -46,7 +46,12 @@ VISION_ROOT = PROJECT_ROOT / "vision"
 sys.path.insert(0, str(VISION_ROOT))
 sys.path.insert(0, str(ROOT))
 
-from rescue_vision.camera import CameraDecoderError, LatestFrameCamera, resolve_camera_device  # noqa: E402
+from rescue_vision.camera import (  # noqa: E402
+    FINALS_EXPOSURE_100US,
+    CameraDecoderError,
+    LatestFrameCamera,
+    resolve_camera_device,
+)
 from rescue_vision.config import load_config, require_native_resolution  # noqa: E402
 from rescue_vision.localizer import GroundLocalizer, ApproachRangeCalibration  # noqa: E402
 from rescue_vision.models import Detection, TrackState  # noqa: E402
@@ -3932,7 +3937,7 @@ def main() -> int:
                 open_started_ns = camera_recovery.open_started()
             opened = LatestFrameCamera(camera_device, IMAGE_WIDTH, IMAGE_HEIGHT, args.camera_fps,
                 decoder=attempted_decoder, decode_fps=args.decode_fps, output_format=camera_output_format,
-                use_source_timestamp=True)
+                use_source_timestamp=True, exposure_100us=FINALS_EXPOSURE_100US)
             opened.start()
         except Exception as error:
             # LatestFrameCamera.start cleans up its failed open. Do not leave a

@@ -21,6 +21,9 @@ except (ImportError, ValueError) as exc:
     ) from exc
 
 
+FINALS_EXPOSURE_100US = 166  # 16.6 ms, closest setting at or below 1/60 s.
+
+
 @dataclass(frozen=True)
 class CameraFrame:
     frame_id: int
@@ -61,7 +64,8 @@ def resolve_camera_device(requested: str, *, prefer_stable: bool = False) -> str
 class LatestFrameCamera:
     def __init__(self, device: str, width: int, height: int, fps: int,
                  decoder: str = "jpu", decode_fps: float = 60.0,
-                 output_format: str = "bgr", *, use_source_timestamp: bool = False) -> None:
+                 output_format: str = "bgr", *, use_source_timestamp: bool = False,
+                 exposure_100us: int | None = None) -> None:
         Gst.init(None)
         self.width = width
         self.height = height
@@ -86,7 +90,7 @@ class LatestFrameCamera:
         if decoder != "jpu" and output_format != "bgr":
             raise ValueError("NV12 output currently requires the JPU decoder")
         source = (
-            f"v4l2src device={device} io-mode=mmap do-timestamp=true ! "
+            f"v4l2src name=vision_source device={device} io-mode=mmap do-timestamp=true ! "
             f"image/jpeg,width={width},height={height},framerate={fps}/1 ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
         )
@@ -99,6 +103,11 @@ class LatestFrameCamera:
                 "appsink name=vision_sink emit-signals=true max-buffers=1 drop=true sync=false"
             )
         self.pipeline = Gst.parse_launch(description)
+        if exposure_100us is not None:
+            controls = Gst.Structure.new_empty("controls")
+            controls.set_value("auto_exposure", 1)
+            controls.set_value("exposure_time_absolute", exposure_100us)
+            self.pipeline.get_by_name("vision_source").set_property("extra-controls", controls)
         self.sink = self.pipeline.get_by_name("vision_sink")
         self.sink.connect("new-sample", self._on_sample)
         self.bus = self.pipeline.get_bus()

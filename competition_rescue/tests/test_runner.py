@@ -71,6 +71,7 @@ def test_camera_reopen_failure_keeps_session_and_waits_for_first_result():
                 monotonic_ns=lambda: int(clock.now * 1e9),
                 sleep=sleep)
             planner = Mock(error=None, termination_result={}, localization_wheel_policy=None)
+            planner.view_boundary.observe.return_value = 0
             detector = Mock(input_width=640, input_height=640, shapes={}, preprocess="vse")
             packet = capture.CameraFrame(1, np.zeros((1024, 1280, 3), np.uint8), 1_000_000_000)
             packets = []
@@ -123,6 +124,7 @@ def test_camera_reopen_failure_keeps_session_and_waits_for_first_result():
             count=2 if unplug else 4
             assert [call.args[0] for call in cameras.call_args_list] == [str(stable)] * count
             assert [call.kwargs["decoder"] for call in cameras.call_args_list] == ["jpu"] + [recovery_decoder] * (count-1)
+            assert [call.kwargs["exposure_100us"] for call in cameras.call_args_list] == [166] * count
             views = [call.args[0].frame_sequence for call in planner.set_vision.call_args_list]
             assert views == [1, 0, 2]  # New camera-local frame 1, same running round.
             rows = [json.loads(line) for line in (root / "events").read_text().splitlines()]
