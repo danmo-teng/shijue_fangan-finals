@@ -1,6 +1,6 @@
 # 决赛超时撤离和首件确认
 
-历史记录。当前送达记账跟随[初赛正式流程迁移](CROSS_REPO_REQUESTS.md)。
+当前已恢复下述确认接口，配套基线和三件重推的交接以[两端最新修改要求](CROSS_REPO_REQUESTS.md)为准。以下为原实现记录。
 
 下位配套基于 `kkkkkkkkkkkkkkkk222222/Final_Run` 的 `Final_task@fd63ab7e62e97630ee4625facc3ad20e99278e6d`。用户已同意沿用开爪和撤离，未确认送达时继续原搜索阶段。
 

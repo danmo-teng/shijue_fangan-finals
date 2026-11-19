@@ -3552,7 +3552,7 @@ def test_delivery_local_timeout_exit_wins_pending_completion_without_reusing_act
     _check_local_delivery_exit(16, 'delivery_push_timeout')
 
 
-def test_delivery_repush_exit_is_counted_once_with_or_without_pending_complete():
+def test_delivery_repush_exit_without_confirmation_does_not_count():
     from state_machine import STM_MODE_REPUSH_EXIT
     _check_local_delivery_exit(STM_MODE_REPUSH_EXIT, 'delivery_repush_finished')
 
@@ -3566,8 +3566,11 @@ def _check_local_delivery_exit(exit_mode, basis):
             root = Path(d)
             m = CompetitionMission(CompetitionSettings(side='red', initial_stash_enabled=False,
                                                        delivery_early_exit_enabled=True))
-            m._select_batch(CargoBatch((11,), ('injured_orange',), 'injury'))
-            m.carried_manifest = ('injured_orange',)
+            cargo_classes = ('green_supply',) if exit_mode == 16 else ('core_black',) * 3
+            m._select_batch(CargoBatch((11,), cargo_classes, 'material'))
+            m.carried_manifest = cargo_classes
+            m.confirmed_delivery_destination = 'material'
+            m.first_common_delivered = exit_mode != 16
             m.state = CompetitionState.ENTER_SAFE_ZONE
             planner = CompetitionPlanner(m, root/'pose', root/'stm', root/'command',
                                          root/'diag', JsonlLog(root/'events'), 50)
@@ -3592,11 +3595,58 @@ def _check_local_delivery_exit(exit_mode, basis):
             assert result.state == CompetitionState.RETURN_CENTER
             assert result.event == basis + '_exit'
             assert m.delivery_completion_basis == basis
-            assert m.delivery_count == 1
+            assert m.delivery_count == 0 and m.first_common_delivered == (exit_mode != 16)
             planner._publish(result)
             assert result.command.opcode == CMD_RETURN_CENTER
             assert planner.protocol_action == (high_water + 1) & 65535
             assert planner._reconcile_delivery_local_exit(PoseSnapshot(valid=True), status, 2.2) is None
+
+
+def test_finals_pause_and_hot_stop_record_only_the_matching_confirmed_exit():
+    from dataclasses import replace
+    from unittest.mock import patch
+    from protocol import CMD_TASK_COMPLETE
+    from round_resume import match_progress, restore_progress
+    from state_machine import CargoAudit, CargoBatch, TrackedCargo
+
+    for operation in ("pause", "camera", "stop"):
+        for confirmed in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                m = CompetitionMission(CompetitionSettings(side="red", initial_stash_enabled=False))
+                m._select_batch(CargoBatch((11,), ("green_supply",), "material"))
+                m._latch_carried_manifest(CargoAudit(left_class="green_supply", left_count=1, total_count=1))
+                planner = CompetitionPlanner(m, root/"pose", root/"stm", root/"command",
+                                             root/"diag", JsonlLog(root/"events"), 50)
+                request = m._finish_delivery(StmSnapshot(age_ms=0), 1.,
+                    basis="delivery_visual_confirmed" if confirmed else "delivery_visual_timeout",
+                    message="fixture", event="")
+                planner._publish(request)
+                done = StmSnapshot(mode=16, age_ms=0, context_valid=True, task_id=planner.protocol_task,
+                                   action_id=planner.protocol_action, accepted_command=CMD_TASK_COMPLETE,
+                                   action_status=3)
+                planner.pause_reason = "manual" if operation == "pause" else "camera"
+                for unrelated in (replace(done, action_id=(done.action_id - 1) & 0xffff),
+                                  replace(done, action_status=1), replace(done, flags=2)):
+                    out = planner._output_for_cycle(VisionSnapshot(), PoseSnapshot(), unrelated, True, 1.1)
+                    assert out.command.opcode == runner_module.CMD_PAUSE
+                    assert m.delivery_count == 0
+                if operation == "stop":
+                    with patch.object(runner_module, "load_stm", return_value=done), \
+                         patch.object(runner_module, "TERMINATION_ABORT_TIMEOUT_S", 0):
+                        planner.stop("operator_stop", preserve_warm=True)
+                else:
+                    for now in (1.2, 1.3):
+                        out = planner._output_for_cycle(VisionSnapshot(), PoseSnapshot(), done, True, now)
+                        assert out.command.opcode == runner_module.CMD_PAUSE
+                    assert m.state == CompetitionState.TASK_COMPLETE
+                resumed = CompetitionMission(m.settings)
+                restore_progress(resumed, match_progress(m))
+                assert resumed.first_common_delivered == confirmed
+                assert resumed.delivery_count == int(confirmed)
+                core = TrackedCargo(1, "core_black", .9, (500, 500, 50, 50), hits=3)
+                assert resumed._choose_search_target(VisionSnapshot(cargo=(core,))) == (core if confirmed else None)
+
 
 
 def test_closed_deflect_runner_carries_pose_and_preserves_motion_action():

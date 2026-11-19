@@ -57,6 +57,7 @@ from protocol import (
     CMD_RETURN_CENTER,
     CMD_SIDE_VALID,
     CMD_TASK_COMPLETE,
+    TASK_COMPLETE_UNCONFIRMED,
     CMD_TARGET_RIGHT,
     CMD_ENTER_SAFE_ZONE,
     CMD_YIELD_BACKOFF,
@@ -74,6 +75,7 @@ CARGO_CLASSES = frozenset(
     {"green_supply", "core_black", "injured_orange", "danger_cyan", "unknown"}
 )
 MATERIAL_CLASSES = frozenset({"green_supply", "core_black"})
+POST_FIRST_CARGO_ORDER = ("core_black", "green_supply", "injured_orange")
 
 STM_MODE_SEARCH = 3
 STM_MODE_NAVIGATE = 10
@@ -1979,9 +1981,7 @@ class CompetitionMission:
         items = [item for item in vision.cargo if item.visible and item.inside_safe_zone
                  and item.track_id in zones and item.hits >= 2
                  and item.class_name in MATERIAL_CLASSES | {"injured_orange"}]
-        if not self.first_common_delivered:
-            items = [i for i in items if i.class_name == "green_supply"]
-        target = self._choose_nearest_cargo(vision, items)
+        target = self._choose_delivery_target(vision, items)
         if target is None:
             return None
         batch = CargoBatch((target.track_id,), (target.class_name,),
@@ -3716,10 +3716,19 @@ class CompetitionMission:
         # needs separation, rather than skipping it for a distant singleton.
         return target if target is not None and self._is_isolated(target, self._visible_cargo(vision)) else None
 
+    def _choose_delivery_target(
+        self, vision: VisionSnapshot, candidates: Iterable[TrackedCargo]
+    ) -> TrackedCargo | None:
+        available = tuple(candidates)
+        order = POST_FIRST_CARGO_ORDER if self.first_common_delivered else ("green_supply",)
+        for kind in order:
+            same_class = [item for item in available if item.class_name == kind]
+            if same_class:
+                return self._choose_nearest_cargo(vision, same_class)
+        return None
+
     def _choose_search_target(self, vision: VisionSnapshot) -> TrackedCargo | None:
-        # Post-first selection: compare every legal destination together before
-        # deciding whether the selected target needs the existing pile path.
-        return self._choose_nearest_cargo(vision, (
+        return self._choose_delivery_target(vision, (
             item for item in self._visible_cargo(vision)
             if item.class_name in MATERIAL_CLASSES | {"injured_orange"} and item.hits >= 2
         ))
@@ -3913,39 +3922,23 @@ class CompetitionMission:
         return (self._legal_separation_side_manifest(audit, side) or
                 self._orange_mixed_side_manifest(audit, side))
 
-    def _orange_core_pair_choice(self, audit: CargoAudit) -> tuple[str, str] | None:
-        if (not self.first_common_delivered or not self.selected_batch or self.selected_batch.initial_stash or
-                audit.total_count != 2 or audit.danger_present or audit.unknown_present or
-                Counter(self._manifest_for_audit(audit)) != {"core_black": 1, "injured_orange": 1}):
-            return None
-        for side in ("left", "right"):
-            items = self._separation_side_manifest(audit, side)
-            if items == ("injured_orange",):
-                return side, "injured_orange"
-            if "core_black" in items and "injured_orange" in items:
-                at_injury_gate = self.state == CompetitionState.TRANSPORT_AUDIT or self.transport_separation_active
-                keep_orange = at_injury_gate and self.carried_manifest == ("injured_orange",)
-                return side, "injured_orange" if keep_orange else "core_black"
-        return None
-
     def _retained_class(self, audit: CargoAudit, side: str) -> str | None:
-        choice = self._orange_core_pair_choice(audit)
-        if choice is not None and choice[0] == side:
-            return choice[1]
         items = self._separation_side_manifest(audit, side)
-        return next((name for name in ("injured_orange", "green_supply", "core_black") if name in items), None)
+        return next((kind for kind in POST_FIRST_CARGO_ORDER if kind in items), None)
 
     def _post_first_preferred_keep_side(self, audit: CargoAudit) -> str | None:
-        choice = self._orange_core_pair_choice(audit)
-        if choice is not None:
-            return choice[0]
-        candidates = {side: self._legal_separation_side_manifest(audit, side)
-                      for side in ("left", "right")}
+        sides = ("left", "right")
+        candidates = {side: self._legal_separation_side_manifest(audit, side) for side in sides}
         candidates = {side: items for side, items in candidates.items() if items}
         if not candidates:
-            return None
-        most_green = max(items.count("green_supply") for items in candidates.values())
-        choices = [side for side, items in candidates.items() if items.count("green_supply") == most_green]
+            candidates = {side: self._orange_mixed_side_manifest(audit, side) for side in sides}
+            candidates = {side: items for side, items in candidates.items() if items}
+            if not candidates:
+                return None
+        ranks = {side: tuple(items.count(kind) for kind in POST_FIRST_CARGO_ORDER)
+                 for side, items in candidates.items()}
+        best = max(ranks.values())
+        choices = [side for side, rank in ranks.items() if rank == best]
         locked = self.cluster_keep_side or self.separation_keep_side
         return locked if locked in choices else choices[0]
 
@@ -5583,30 +5576,41 @@ class CompetitionMission:
     def _finish_delivery(
         self, stm: StmSnapshot, now: float, *, basis: str, message: str, event: str
     ) -> CompetitionOutput:
-        batch = self.selected_batch
         if self.obstacle_route is not None and self.obstacle_route.awaiting_obstacle_delivery:
             self.obstacle_route.recover_after_delivery = True
         self.delivery_completion_basis = basis
         self._clear_cluster_context(reset_attempts=True)
         self._set_state(CompetitionState.TASK_COMPLETE, now)
         self.task_complete_initial_ack = stm.acknowledged_sequence
-        if not self.delivery_counted_for_batch:
-            self.delivery_count += 1
-            self.delivery_counted_for_batch = True
-        if (
-            self.carried_has_green or
-            (batch is not None and "green_supply" in batch.classes)
-        ):
-            self.first_common_delivered = True
         return CompetitionOutput(
             self.state,
-            CommandRequest(CMD_TASK_COMPLETE, self._side_flags()),
+            self._task_complete_command(),
             message,
-            batch,
+            self.selected_batch,
             event=event,
             tx_policy="normal_command",
             reason=basis,
         )
+
+    def _task_complete_command(self) -> CommandRequest:
+        confirmed = self.delivery_completion_basis in {"delivery_visual_early", "delivery_visual_confirmed"}
+        return CommandRequest(CMD_TASK_COMPLETE, self._side_flags(),
+                              aux=0 if confirmed else TASK_COMPLETE_UNCONFIRMED)
+
+    def _observe_delivery_completion(self, stm: StmSnapshot) -> bool:
+        done = (
+            self.state == CompetitionState.TASK_COMPLETE and
+            stm.fresh and not stm.fault and not stm.gripper_closed and
+            stm.context_valid and stm.context_matches and
+            stm.accepted_command == CMD_TASK_COMPLETE and stm.action_status & 3 == 3 and
+            stm.mode in {STM_MODE_EXIT_SAFE_ZONE, STM_MODE_FACE_FIELD_CENTER}
+        )
+        if done and not self.delivery_counted_for_batch and self._task_complete_command().aux == 0:
+            self.delivery_count += 1
+            self.delivery_counted_for_batch = True
+            if self.carried_manifest == ("green_supply",) and self.confirmed_delivery_destination == "material":
+                self.first_common_delivered = True
+        return done
 
     def _delivery_local_exit_output(
         self, pose: PoseSnapshot, stm: StmSnapshot, now: float,
@@ -5641,7 +5645,7 @@ class CompetitionMission:
             stm,
             now,
             basis="delivery_visual_timeout",
-            message="投送视觉观察达到1秒仍未确认，发送TASK_COMPLETE进入退出返中阶段",
+            message="投送视觉观察达到1秒仍未确认，按未确认退出并返回搜索点",
             event="delivery_timeout_complete",
         )
 
@@ -6270,7 +6274,7 @@ class CompetitionMission:
                 item for item in candidates if item.class_name == "green_supply"
             ]
         else:
-            # Use the same nearest legal target for both single and pile approaches.
+            # Single and pile approaches use the same priority and distance ordering.
             target = self._choose_search_target(vision)
             return target if target in candidates else None
         return self._choose_nearest_cargo(vision, candidates)
@@ -8602,20 +8606,7 @@ class CompetitionMission:
             local_exit = self._delivery_local_exit_output(pose, stm, now)
             if local_exit is not None:
                 return local_exit
-            if (self.delivery_completion_basis == "delivery_visual_early" and not (
-                    stm.fresh and not stm.gripper_closed and stm.context_valid and stm.context_matches and
-                    stm.accepted_command == CMD_TASK_COMPLETE and stm.action_status & 3 == 3 and
-                    stm.mode in {STM_MODE_EXIT_SAFE_ZONE, STM_MODE_FACE_FIELD_CENTER})):
-                return CompetitionOutput(self.state, CommandRequest(CMD_TASK_COMPLETE, self._side_flags()),
-                    "提前完成请求已发出，等待本次开爪/退出回包", self.selected_batch,
-                    reason="delivery_early_release_pending")
-            if (
-                stm.fresh and
-                stm.mode in {
-                    STM_MODE_EXIT_SAFE_ZONE,
-                    STM_MODE_FACE_FIELD_CENTER,
-                }
-            ):
+            if self._observe_delivery_completion(stm):
                 self._clear_selected_batch()
                 self._begin_return(stm, now, after_delivery=True)
                 return self._return_center_output(
@@ -8629,7 +8620,11 @@ class CompetitionMission:
                 self._clear_selected_batch()
                 self._begin_return(stm, now, after_delivery=True)
                 return self._return_center_output(pose, now, "投送后接回记住的搜索点")
-            return CompetitionOutput(self.state, CommandRequest(CMD_TASK_COMPLETE, self._side_flags()), "等待下位机张爪并退出安全区")
+            if self.delivery_completion_basis == "delivery_visual_early":
+                return CompetitionOutput(self.state, self._task_complete_command(),
+                    "提前完成请求已发出，等待本次开爪/退出回包", self.selected_batch,
+                    reason="delivery_early_release_pending")
+            return CompetitionOutput(self.state, self._task_complete_command(), "等待本次下位机张爪并退出安全区")
 
         if self.state == CompetitionState.RETURN_CENTER:
             self._latch_return_command_acceptance(stm)

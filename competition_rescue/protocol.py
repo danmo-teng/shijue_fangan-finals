@@ -32,6 +32,7 @@ CMD_NAVIGATE_WAYPOINT = 0x03
 CMD_ALIGN_SAFE_ZONE = 0x04
 CMD_ENTER_SAFE_ZONE = 0x05
 CMD_TASK_COMPLETE = 0x06
+TASK_COMPLETE_UNCONFIRMED = 1
 CMD_ABORT = 0x07
 CMD_RETURN_CENTER = 0x08
 
@@ -148,6 +149,11 @@ def mission_frame(
         raise ValueError("sequence must be in 0..255")
     if not 0 <= command <= 0xFF or not 0 <= flags <= 0xFF:
         raise ValueError("command and flags must be bytes")
+    if command == CMD_TASK_COMPLETE and (
+        not flags & CMD_VALID or flags & ~(CMD_VALID | CMD_RED_SIDE) or
+        arg_a != 0 or arg_b != 0 or aux_cdeg not in {0, TASK_COMPLETE_UNCONFIRMED}
+    ):
+        raise ValueError("invalid task completion payload")
     if command in {CMD_ORANGE_CORE_FILTER, CMD_ORANGE_GATE_FILTER}:
         raise ValueError("lift filter commands are disabled in finals")
     if command == CMD_CORRIDOR_NUDGE:

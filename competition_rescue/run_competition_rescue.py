@@ -1949,6 +1949,8 @@ class CompetitionPlanner:
         abort_sequence = self.sequence
         abort_frame = abort_command.to_frame(abort_sequence)
         before = load_stm(self.stm_path)
+        if preserve_warm and not self.thread.is_alive():
+            self._observe_completed_delivery(before)
         result = {
             "attempted": True,
             "reason": reason,
@@ -2504,6 +2506,12 @@ class CompetitionPlanner:
         return replace(result, event="approach_request_rejected",
                        reason="approach_recover_after_reject")
 
+    def _observe_completed_delivery(self, stm: StmSnapshot) -> None:
+        pending = self.protocol_last_output.command if self.protocol_last_output else None
+        if pending is not None and pending.opcode == CMD_TASK_COMPLETE:
+            matches = stm.task_id == self.protocol_task and stm.action_id == self.protocol_action
+            self.mission._observe_delivery_completion(replace(stm, context_matches=matches))
+
     def _output_for_cycle(
         self,
         vision: VisionSnapshot,
@@ -2512,6 +2520,8 @@ class CompetitionPlanner:
         paused: bool,
         now: float,
     ) -> CompetitionOutput:
+        if paused:
+            self._observe_completed_delivery(stm)
         ready_ns = self.view_boundary.observe(stm)
         if (not paused and not stm.fault and stm.received_monotonic_ns and vision.frame_sequence
                 and (stm.mode in (3, 11, 15, 20, 21, 23, 37, 38, 43, 45, 48, 52)
