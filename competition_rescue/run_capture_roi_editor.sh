@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "${script_dir}/.." && pwd)"
-vision_model="${project_dir}/vision/x5_output_640/hardcases_e24_x5_bayese_640x640_nv12.bin"
+vision_model="${project_dir}/yolo26n/x5_output_640_1119_final/yolo26n_6cls_640_1119_final_bpu_bayese_640x640_nv12.bin"
 
 if [[ ! -f "${vision_model}" ]]; then
     echo "YOLO模型缺失：${vision_model}" >&2
